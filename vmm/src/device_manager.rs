@@ -1144,7 +1144,15 @@ fn create_mmio_allocators(
     for segment_id in 0..num_pci_segments as u64 {
         let weight = weights[segment_id as usize] as u64;
         let mmio_start = start + i * pci_segment_mmio_size;
-        let mmio_size = pci_segment_mmio_size * weight;
+        let is_last = segment_id == num_pci_segments as u64 - 1;
+        // Give the last segment all remaining space so no addresses
+        // near the top of the physical address space are lost to
+        // alignment truncation.
+        let mmio_size = if is_last {
+            end - mmio_start + 1
+        } else {
+            pci_segment_mmio_size * weight
+        };
         let allocator = Arc::new(Mutex::new(
             AddressAllocator::new(GuestAddress(mmio_start), mmio_size).unwrap(),
         ));
