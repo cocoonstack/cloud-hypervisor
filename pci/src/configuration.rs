@@ -1093,6 +1093,20 @@ impl PciConfiguration {
     pub(crate) fn clear_pending_bar_reprogram(&mut self) {
         self.pending_bar_reprogram = Vec::new();
     }
+
+    /// Restore BAR address after a failed move. This undoes the premature
+    /// address update in detect_bar_reprogramming() so that config space
+    /// stays consistent with the actual MMIO mapping.
+    pub fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
+        for bar in self.bars.iter_mut() {
+            if u64::from(bar.addr) == params.new_base
+                || (u64::from(bar.addr) << 32) == params.new_base
+            {
+                bar.addr = params.old_base as u32;
+                break;
+            }
+        }
+    }
 }
 
 impl Pausable for PciConfiguration {}
