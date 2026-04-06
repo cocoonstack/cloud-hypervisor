@@ -31,8 +31,7 @@ jobs:
 
       - name: Build cloud-hypervisor (release)
         run: |
-          cargo build --release --bin cloud-hypervisor --features mshv
-          strip target/release/cloud-hypervisor
+          cargo build --release
 
       - name: Generate checksum and build metadata
         run: |
