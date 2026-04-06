@@ -7,31 +7,80 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: dev-release
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Install Rust toolchain
+      - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89.0"
+
+      - name: Show toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
 
       - name: Build cloud-hypervisor (release)
-        run: cargo build --release
+        run: |
+          cargo build --release --bin cloud-hypervisor --features mshv
+          strip target/release/cloud-hypervisor
+
+      - name: Generate checksum and build metadata
+        run: |
+          artifact=target/release/cloud-hypervisor
+          sha256sum "$artifact" > "${artifact}.sha256"
+          cat > target/release/build-info.json <<EOF
+          {
+            "ref": "${GITHUB_REF_NAME}",
+            "commit": "${GITHUB_SHA}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "run_attempt": "${GITHUB_RUN_ATTEMPT}",
+            "workflow": "${GITHUB_WORKFLOW}",
+            "rustc": "$(rustc --version --verbose | tr '\n' '; ' | sed 's/; $//')",
+            "cargo": "$(cargo --version --verbose | tr '\n' '; ' | sed 's/; $//')"
+          }
+          EOF
+
+      - name: Move dev tag to current commit
+        run: |
+          git tag -f dev "${GITHUB_SHA}"
+          git push origin refs/tags/dev --force
 
       - name: Upload binary as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cloud-hypervisor
-          path: target/release/cloud-hypervisor
+          path: |
+            target/release/cloud-hypervisor
+            target/release/cloud-hypervisor.sha256
+            target/release/build-info.json
 
       - name: Create dev release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: dev
+          target_commitish: ${{ github.sha }}
           name: Dev Build
-          files: target/release/cloud-hypervisor
+          body: |
+            Branch: `${{ github.ref_name }}`
+            Commit: `${{ github.sha }}`
+            Workflow Run: `${{ github.run_id }}`
+          files: |
+            target/release/cloud-hypervisor
+            target/release/cloud-hypervisor.sha256
+            target/release/build-info.json
           prerelease: true
           make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
