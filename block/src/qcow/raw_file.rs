@@ -54,6 +54,61 @@ fn is_valid_alignment(fd: RawFd, alignment: usize) -> bool {
     ret >= 0
 }
 
+fn pread_fill(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    let mut total = 0usize;
+    while total < buf.len() {
+        // SAFETY: FFI call. All parameters are valid.
+        let ret = unsafe {
+            ::libc::pread64(
+                fd,
+                buf[total..].as_mut_ptr() as *mut c_void,
+                buf.len() - total,
+                (offset + total as u64).try_into().unwrap(),
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            break;
+        }
+        total += ret as usize;
+    }
+    Ok(total)
+}
+
+fn pread_all(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    let read = pread_fill(fd, buf, offset)?;
+    if read == buf.len() {
+        Ok(())
+    } else {
+        Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+    }
+}
+
+fn pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
+    let mut total = 0usize;
+    while total < buf.len() {
+        // SAFETY: FFI call. All parameters are valid.
+        let ret = unsafe {
+            ::libc::pwrite64(
+                fd,
+                buf[total..].as_ptr() as *const c_void,
+                buf.len() - total,
+                (offset + total as u64).try_into().unwrap(),
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            return Err(io::Error::other("pwrite64 wrote 0 bytes"));
+        }
+        total += ret as usize;
+    }
+    Ok(())
+}
+
 impl RawFile {
     pub fn new(file: File, direct_io: bool) -> Self {
         // Assume no alignment restrictions if we aren't using O_DIRECT.
@@ -96,6 +151,18 @@ impl RawFile {
             && buf.len().is_multiple_of(self.alignment)
     }
 
+    fn is_aligned_at(&self, offset: u64, buf: &[u8]) -> bool {
+        if self.alignment == 0 {
+            return true;
+        }
+
+        let align64: u64 = self.alignment.try_into().unwrap();
+
+        offset.is_multiple_of(align64)
+            && (buf.as_ptr() as usize).is_multiple_of(self.alignment)
+            && buf.len().is_multiple_of(self.alignment)
+    }
+
     pub fn set_len(&self, size: u64) -> std::io::Result<()> {
         self.file.set_len(size)
     }
@@ -123,6 +190,77 @@ impl RawFile {
 
     pub fn is_direct(&self) -> bool {
         self.direct_io
+    }
+
+    pub fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        if self.is_aligned_at(offset, buf) {
+            return pread_all(self.file.as_raw_fd(), buf, offset);
+        }
+
+        let rounded_pos = self.round_down(offset);
+        let file_offset: usize = offset.checked_sub(rounded_pos).unwrap().try_into().unwrap();
+        let rounded_len: usize = self
+            .round_up((file_offset + buf.len()).try_into().unwrap())
+            .try_into()
+            .unwrap();
+
+        let layout = Layout::from_size_align(rounded_len, self.alignment).unwrap();
+        // SAFETY: layout has non-zero size.
+        let tmp_ptr = unsafe { alloc_zeroed(layout) };
+        if tmp_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: tmp_ptr is valid for rounded_len bytes.
+        let tmp_buf = unsafe { slice::from_raw_parts_mut(tmp_ptr, rounded_len) };
+        let result = pread_all(self.file.as_raw_fd(), tmp_buf, rounded_pos).map(|_| {
+            buf.copy_from_slice(&tmp_buf[file_offset..(file_offset + buf.len())]);
+        });
+
+        // SAFETY: tmp_ptr was allocated by alloc_zeroed with layout.
+        unsafe { dealloc(tmp_ptr, layout) };
+
+        result
+    }
+
+    pub fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        if self.is_aligned_at(offset, buf) {
+            return pwrite_all(self.file.as_raw_fd(), buf, offset);
+        }
+
+        let rounded_pos = self.round_down(offset);
+        let file_offset: usize = offset.checked_sub(rounded_pos).unwrap().try_into().unwrap();
+        let rounded_len: usize = self
+            .round_up((file_offset + buf.len()).try_into().unwrap())
+            .try_into()
+            .unwrap();
+
+        let layout = Layout::from_size_align(rounded_len, self.alignment).unwrap();
+        // SAFETY: layout has non-zero size.
+        let tmp_ptr = unsafe { alloc_zeroed(layout) };
+        if tmp_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        // SAFETY: tmp_ptr is valid for rounded_len bytes.
+        let tmp_buf = unsafe { slice::from_raw_parts_mut(tmp_ptr, rounded_len) };
+        let result = pread_fill(self.file.as_raw_fd(), tmp_buf, rounded_pos).and_then(|_| {
+            tmp_buf[file_offset..(file_offset + buf.len())].copy_from_slice(buf);
+            pwrite_all(self.file.as_raw_fd(), tmp_buf, rounded_pos)
+        });
+
+        // SAFETY: tmp_ptr was allocated by alloc_zeroed with layout.
+        unsafe { dealloc(tmp_ptr, layout) };
+
+        result
     }
 
     /// Returns true if the file was opened with write access.

@@ -5,7 +5,7 @@
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 use std::{fmt, io, ptr, slice};
 
@@ -25,7 +25,7 @@ use crate::qcow::{
 
 /// Raw backing file using pread64 on a duplicated fd.
 struct RawBacking {
-    fd: OwnedFd,
+    file: RawFile,
     virtual_size: u64,
 }
 
@@ -41,9 +41,9 @@ impl BackingRead for RawBacking {
         }
         let available = (self.virtual_size - address) as usize;
         if available >= buf.len() {
-            pread_exact(self.fd.as_raw_fd(), buf, address)
+            self.file.read_exact_at(address, buf)
         } else {
-            pread_exact(self.fd.as_raw_fd(), &mut buf[..available], address)?;
+            self.file.read_exact_at(address, &mut buf[..available])?;
             buf[available..].fill(0);
             Ok(())
         }
@@ -56,7 +56,7 @@ impl BackingRead for RawBacking {
 /// files are handled recursively.
 struct Qcow2MetadataBacking {
     metadata: Arc<QcowMetadata>,
-    data_fd: OwnedFd,
+    data_file: QcowRawFile,
     backing_file: Option<Arc<dyn BackingRead>>,
 }
 
@@ -103,10 +103,9 @@ impl Qcow2MetadataBacking {
                     offset: host_offset,
                     length,
                 } => {
-                    pread_exact(
-                        self.data_fd.as_raw_fd(),
-                        &mut buf[buf_offset..buf_offset + length as usize],
+                    self.data_file.read_exact_at(
                         host_offset,
+                        &mut buf[buf_offset..buf_offset + length as usize],
                     )?;
                     buf_offset += length as usize;
                 }
@@ -141,8 +140,8 @@ impl Drop for Qcow2MetadataBacking {
 fn shared_backing_from(bf: BackingFile) -> BlockResult<Arc<dyn BackingRead>> {
     let (kind, virtual_size) = bf.into_kind();
 
-    let dup_fd = |fd: BorrowedFd<'_>| -> BlockResult<OwnedFd> {
-        fd.try_clone_to_owned().map_err(|e| {
+    let dup_raw_file = |raw_file: &RawFile| -> BlockResult<RawFile> {
+        raw_file.try_clone().map_err(|e| {
             BlockError::new(
                 BlockErrorKind::Io,
                 QcowError::BackingFileIo(String::new(), e),
@@ -153,14 +152,14 @@ fn shared_backing_from(bf: BackingFile) -> BlockResult<Arc<dyn BackingRead>> {
 
     match kind {
         BackingKind::Raw(raw_file) => {
-            let fd = dup_fd(raw_file.as_fd())?;
-            Ok(Arc::new(RawBacking { fd, virtual_size }))
+            let file = dup_raw_file(&raw_file)?;
+            Ok(Arc::new(RawBacking { file, virtual_size }))
         }
         BackingKind::Qcow { inner, backing } => {
-            let data_fd = dup_fd(inner.raw_file.as_fd())?;
+            let data_file = inner.raw_file.clone();
             Ok(Arc::new(Qcow2MetadataBacking {
                 metadata: Arc::new(QcowMetadata::new(*inner)),
-                data_fd,
+                data_file,
                 backing_file: backing.map(|bf| shared_backing_from(*bf)).transpose()?,
             }))
         }
@@ -322,60 +321,6 @@ impl QcowSync {
     }
 }
 
-// -- Position independent I/O helpers --
-//
-// Duplicated file descriptors share the kernel file description and thus the
-// file position. Using seek then read from multiple queues races on that
-// shared position. pread64 and pwrite64 are atomic and never touch the position.
-
-/// Read exactly the requested bytes at offset, looping on short reads.
-fn pread_exact(fd: RawFd, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    let mut total = 0usize;
-    while total < buf.len() {
-        // SAFETY: buf and fd are valid for the lifetime of the call.
-        let ret = unsafe {
-            libc::pread64(
-                fd,
-                buf[total..].as_mut_ptr() as *mut libc::c_void,
-                buf.len() - total,
-                (offset + total as u64) as libc::off_t,
-            )
-        };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if ret == 0 {
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
-        }
-        total += ret as usize;
-    }
-    Ok(())
-}
-
-/// Write all bytes to fd at offset, looping on short writes.
-fn pwrite_all(fd: RawFd, buf: &[u8], offset: u64) -> io::Result<()> {
-    let mut total = 0usize;
-    while total < buf.len() {
-        // SAFETY: buf and fd are valid for the lifetime of the call.
-        let ret = unsafe {
-            libc::pwrite64(
-                fd,
-                buf[total..].as_ptr() as *const libc::c_void,
-                buf.len() - total,
-                (offset + total as u64) as libc::off_t,
-            )
-        };
-        if ret < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if ret == 0 {
-            return Err(io::Error::other("pwrite64 wrote 0 bytes"));
-        }
-        total += ret as usize;
-    }
-    Ok(())
-}
-
 // -- iovec helper functions --
 //
 // Operate on the iovec array as a flat byte stream.
@@ -502,7 +447,8 @@ impl AsyncIo for QcowSync {
                     length,
                 } => {
                     let mut buf = vec![0u8; length as usize];
-                    pread_exact(self.data_file.as_raw_fd(), &mut buf, host_offset)
+                    self.data_file
+                        .read_exact_at(host_offset, &mut buf)
                         .map_err(AsyncIoError::ReadVectored)?;
                     // SAFETY: iovecs point to valid guest memory buffers
                     unsafe { scatter_to_iovecs(iovecs, buf_offset, &buf) };
@@ -582,7 +528,8 @@ impl AsyncIo for QcowSync {
                 } => {
                     // SAFETY: iovecs point to valid guest memory buffers
                     let buf = unsafe { gather_from_iovecs(iovecs, buf_offset, count) };
-                    pwrite_all(self.data_file.as_raw_fd(), &buf, host_offset)
+                    self.data_file
+                        .write_all_at(host_offset, &buf)
                         .map_err(AsyncIoError::WriteVectored)?;
                 }
             }
@@ -671,7 +618,9 @@ impl AsyncIo for QcowSync {
 
 #[cfg(test)]
 mod unit_tests {
+    use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::thread;
 
     use vmm_sys_util::tempfile::TempFile;
@@ -732,6 +681,36 @@ mod unit_tests {
         let (user_data, result) = async_io.next_completed_request().unwrap();
         assert_eq!(user_data, 1);
         assert_eq!(result as usize, data.len());
+    }
+
+    #[test]
+    fn test_qcow_async_direct_io_unaligned_write() {
+        let temp_file = TempFile::new().unwrap();
+        let file_size = 4 * 1024 * 1024;
+
+        {
+            let raw_file = RawFile::new(temp_file.as_file().try_clone().unwrap(), false);
+            let mut qcow_file = QcowFile::new(raw_file, 3, file_size, true).unwrap();
+            qcow_file.flush().unwrap();
+        }
+
+        let direct_file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(temp_file.as_path())
+        {
+            Ok(file) => file,
+            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => return,
+            Err(err) => panic!("failed to open qcow file with O_DIRECT: {err}"),
+        };
+
+        let disk = QcowDiskSync::new(direct_file, true, false, true).unwrap();
+        let data = vec![0x5Au8; 512];
+
+        async_write(&disk, 512, &data);
+        let read_back = async_read(&disk, 512, data.len());
+        assert_eq!(read_back, data);
     }
 
     #[test]

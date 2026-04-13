@@ -331,6 +331,14 @@ impl QcowRawFile {
         Ok(())
     }
 
+    pub fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.file.read_exact_at(offset, buf)
+    }
+
+    pub fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        self.file.write_all_at(offset, buf)
+    }
+
     /// Writes
     pub fn write_cluster(&mut self, address: u64, data: &[u8]) -> io::Result<()> {
         let cluster_size = self.cluster_size as usize;
