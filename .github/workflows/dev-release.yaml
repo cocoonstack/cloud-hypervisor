@@ -49,11 +49,6 @@ jobs:
           }
           EOF
 
-      - name: Move dev tag to current commit
-        run: |
-          git tag -f dev "${GITHUB_SHA}"
-          git push origin refs/tags/dev --force
-
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v7
         with:
@@ -83,3 +78,8 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move dev tag to current commit
+        run: |
+          git tag -f dev "${GITHUB_SHA}"
+          git push origin refs/tags/dev --force
