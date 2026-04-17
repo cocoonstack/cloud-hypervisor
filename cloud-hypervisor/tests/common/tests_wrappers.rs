@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::string::String;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use block::ImageType;
 use net_util::MacAddr;
@@ -28,10 +29,9 @@ pub(crate) fn _test_api_create_boot(target_api: &TargetApi, guest: &Guest) {
         .spawn()
         .unwrap();
 
-    thread::sleep(std::time::Duration::new(1, 0));
-
-    // Verify API server is running
-    assert!(target_api.remote_command("ping", None));
+    // Wait for API server to be ready
+    assert!(wait_until(Duration::from_secs(5), || target_api
+        .remote_command("ping", None)));
 
     // Create the VM first
     let request_body = guest.api_create_body();
@@ -68,10 +68,9 @@ pub(crate) fn _test_api_shutdown(target_api: &TargetApi, guest: &Guest) {
         .spawn()
         .unwrap();
 
-    thread::sleep(std::time::Duration::new(1, 0));
-
-    // Verify API server is running
-    assert!(target_api.remote_command("ping", None));
+    // Wait for API server to be ready
+    assert!(wait_until(Duration::from_secs(5), || target_api
+        .remote_command("ping", None)));
 
     // Create the VM first
     let request_body = guest.api_create_body();
@@ -98,7 +97,7 @@ pub(crate) fn _test_api_shutdown(target_api: &TargetApi, guest: &Guest) {
         guest.ssh_command("sudo shutdown -H now").unwrap();
 
         // Wait for the guest to be fully shutdown
-        thread::sleep(std::time::Duration::new(20, 0));
+        assert!(guest.wait_for_ssh_unresponsive(Duration::from_secs(20)));
 
         // Then shut it down
         assert!(target_api.remote_command("shutdown", None));
@@ -129,10 +128,9 @@ pub(crate) fn _test_api_delete(target_api: &TargetApi, guest: &Guest) {
         .spawn()
         .unwrap();
 
-    thread::sleep(std::time::Duration::new(1, 0));
-
-    // Verify API server is running
-    assert!(target_api.remote_command("ping", None));
+    // Wait for API server to be ready
+    assert!(wait_until(Duration::from_secs(5), || target_api
+        .remote_command("ping", None)));
 
     // Create the VM first
     let request_body = guest.api_create_body();
@@ -159,7 +157,7 @@ pub(crate) fn _test_api_delete(target_api: &TargetApi, guest: &Guest) {
         guest.ssh_command("sudo shutdown -H now").unwrap();
 
         // Wait for the guest to be fully shutdown
-        thread::sleep(std::time::Duration::new(20, 0));
+        assert!(guest.wait_for_ssh_unresponsive(Duration::from_secs(20)));
 
         // Then delete it
         assert!(target_api.remote_command("delete", None));
@@ -193,10 +191,9 @@ pub(crate) fn _test_api_pause_resume(target_api: &TargetApi, guest: &Guest) {
         .spawn()
         .unwrap();
 
-    thread::sleep(std::time::Duration::new(1, 0));
-
-    // Verify API server is running
-    assert!(target_api.remote_command("ping", None));
+    // Wait for API server to be ready
+    assert!(wait_until(Duration::from_secs(5), || target_api
+        .remote_command("ping", None)));
 
     // Create the VM first
     let request_body = guest.api_create_body();
@@ -209,9 +206,10 @@ pub(crate) fn _test_api_pause_resume(target_api: &TargetApi, guest: &Guest) {
 
     // Then boot it
     assert!(target_api.remote_command("boot", None));
-    thread::sleep(std::time::Duration::new(20, 0));
 
     let r = std::panic::catch_unwind(|| {
+        guest.wait_vm_boot().unwrap();
+
         // Check that the VM booted as expected
         guest.validate_cpu_count(None);
         guest.validate_memory(None);
@@ -571,13 +569,19 @@ pub(crate) fn test_vhost_user_net(
 
     if client_mode_daemon {
         child = ch_command.spawn().unwrap();
-        // Make sure the VMM is waiting for the backend to connect
-        thread::sleep(std::time::Duration::new(10, 0));
+        // Wait for the VMM to create the socket before starting the daemon
+        assert!(wait_until(Duration::from_secs(10), || Path::new(
+            &vunet_socket_path
+        )
+        .exists()));
         daemon_child = daemon_command.spawn().unwrap();
     } else {
         daemon_child = daemon_command.spawn().unwrap();
-        // Make sure the backend is waiting for the VMM to connect
-        thread::sleep(std::time::Duration::new(10, 0));
+        // Wait for the daemon to create the socket before starting the VMM
+        assert!(wait_until(Duration::from_secs(10), || Path::new(
+            &vunet_socket_path
+        )
+        .exists()));
         child = ch_command.spawn().unwrap();
     }
 
@@ -653,19 +657,19 @@ pub(crate) fn test_vhost_user_net(
             let desired_ram = 1024 << 20;
             resize_command(&api_socket, None, Some(desired_ram), None, None);
 
-            thread::sleep(std::time::Duration::new(10, 0));
-
             // Here by simply checking the size (through ssh), we validate
             // the connection is still working, which means vhost-user-net
             // keeps working after the resize.
-            assert!(guest.get_total_memory().unwrap_or_default() > 960_000);
+            assert!(wait_until(Duration::from_secs(10), || guest
+                .get_total_memory()
+                .unwrap_or_default()
+                > 960_000));
         }
     });
 
     kill_child(&mut child);
     let output = child.wait_with_output().unwrap();
 
-    thread::sleep(std::time::Duration::new(5, 0));
     let _ = daemon_child.kill();
     let _ = daemon_child.wait();
 
@@ -787,9 +791,10 @@ pub(crate) fn test_vhost_user_blk(
             let desired_ram = 1024 << 20;
             resize_command(&api_socket, None, Some(desired_ram), None, None);
 
-            thread::sleep(std::time::Duration::new(10, 0));
-
-            assert!(guest.get_total_memory().unwrap_or_default() > 960_000);
+            assert!(wait_until(Duration::from_secs(10), || guest
+                .get_total_memory()
+                .unwrap_or_default()
+                > 960_000));
 
             // Check again the content of the block device after the resize
             // has been performed.
@@ -808,7 +813,6 @@ pub(crate) fn test_vhost_user_blk(
     let output = child.wait_with_output().unwrap();
 
     if let Some(mut daemon_child) = daemon_child {
-        thread::sleep(std::time::Duration::new(5, 0));
         let _ = daemon_child.kill();
         let _ = daemon_child.wait();
     }
@@ -878,7 +882,6 @@ pub(crate) fn test_boot_from_vhost_user_blk(
     let output = child.wait_with_output().unwrap();
 
     if let Some(mut daemon_child) = daemon_child {
-        thread::sleep(std::time::Duration::new(5, 0));
         let _ = daemon_child.kill();
         let _ = daemon_child.wait();
     }
@@ -903,6 +906,7 @@ pub(crate) fn _test_virtio_fs(
     let disk_config = UbuntuDiskConfig::new(focal_image);
     let guest = Guest::new(Box::new(disk_config));
     let api_socket = temp_api_path(&guest.tmp_dir);
+    let event_path = temp_event_monitor_path(&guest.tmp_dir);
 
     let mut workload_path = dirs::home_dir().unwrap();
     workload_path.push("workloads");
@@ -930,7 +934,8 @@ pub(crate) fn _test_virtio_fs(
         .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
         .default_disks()
         .default_net()
-        .args(["--api-socket", &api_socket]);
+        .args(["--api-socket", &api_socket])
+        .args(["--event-monitor", format!("path={event_path}").as_str()]);
     if pci_segment.is_some() {
         guest_command.args([
             "--platform",
@@ -990,13 +995,14 @@ pub(crate) fn _test_virtio_fs(
                         .contains("{\"id\":\"myfs0\",\"bdf\":\"0000:00:06.0\"}")
                 );
             }
-
-            thread::sleep(std::time::Duration::new(10, 0));
         }
 
         // Mount shared directory through virtio_fs filesystem
         guest
-            .ssh_command("mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/")
+            .wait_for_ssh_command(
+                "mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/",
+                Duration::from_secs(10),
+            )
             .unwrap();
 
         // Check file1 exists and its content is "foo"
@@ -1024,8 +1030,10 @@ pub(crate) fn _test_virtio_fs(
             let desired_ram = 1024 << 20;
             resize_command(&api_socket, None, Some(desired_ram), None, None);
 
-            thread::sleep(std::time::Duration::new(30, 0));
-            assert!(guest.get_total_memory().unwrap_or_default() > 960_000);
+            assert!(wait_until(Duration::from_secs(30), || guest
+                .get_total_memory()
+                .unwrap_or_default()
+                > 960_000));
 
             // After the resize, check again that file1 exists and its
             // content is "foo".
@@ -1039,16 +1047,28 @@ pub(crate) fn _test_virtio_fs(
             // Remove from VM
             guest.ssh_command("sudo umount mount_dir").unwrap();
             assert!(remote_command(&api_socket, "remove-device", Some("myfs0")));
+
+            // Wait for the device to be fully removed before re-adding
+            let removed_event = MetaEvent {
+                event: "device-removed".to_string(),
+                device_id: Some("myfs0".to_string()),
+            };
+            assert!(wait_until(Duration::from_secs(10), || {
+                check_sequential_events(&[&removed_event], &event_path)
+            }));
         }
     });
 
     let (r, hotplug_daemon_child) = if r.is_ok() && hotplug {
-        thread::sleep(std::time::Duration::new(10, 0));
         let (daemon_child, virtiofsd_socket_path) =
             prepare_daemon(&guest.tmp_dir, shared_dir.to_str().unwrap());
 
         let r = std::panic::catch_unwind(|| {
-            thread::sleep(std::time::Duration::new(10, 0));
+            // Wait for the daemon socket to be ready
+            assert!(wait_until(Duration::from_secs(10), || Path::new(
+                &virtiofsd_socket_path
+            )
+            .exists()));
             let fs_params = format!(
                 "id=myfs0,socket={},{}{}",
                 virtiofsd_socket_path,
@@ -1079,10 +1099,13 @@ pub(crate) fn _test_virtio_fs(
                 );
             }
 
-            thread::sleep(std::time::Duration::new(10, 0));
-            // Mount shared directory through virtio_fs filesystem
+            // Mount shared directory through virtio_fs filesystem, retrying
+            // until the hotplugged device is recognized by the guest
             guest
-                .ssh_command("mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/")
+                .wait_for_ssh_command(
+                    "mkdir -p mount_dir && sudo mount -t virtiofs myfs mount_dir/",
+                    Duration::from_secs(10),
+                )
                 .unwrap();
 
             // Check file1 exists and its content is "foo"
@@ -1595,7 +1618,6 @@ pub(crate) fn _test_simple_launch(guest: &Guest) {
         let _ = guest.ssh_command("sudo systemctl stop snapd");
 
         guest.ssh_command("sudo poweroff").unwrap();
-        thread::sleep(std::time::Duration::new(20, 0));
         let latest_events = [
             &MetaEvent {
                 event: "shutdown".to_string(),
@@ -1610,7 +1632,9 @@ pub(crate) fn _test_simple_launch(guest: &Guest) {
                 device_id: None,
             },
         ];
-        assert!(check_latest_events_exact(&latest_events, &event_path));
+        assert!(wait_until(Duration::from_secs(20), || {
+            check_latest_events_exact(&latest_events, &event_path)
+        }));
     });
 
     kill_child(&mut child);
@@ -2690,18 +2714,12 @@ pub(crate) fn _test_disk_hotplug(guest: &Guest, landlock_enabled: bool) {
                 .contains("{\"id\":\"test0\",\"bdf\":\"0000:00:06.0\"}")
         );
 
-        thread::sleep(std::time::Duration::new(10, 0));
-
-        // Check that /dev/vdc exists and the block size is 16M.
-        assert_eq!(
+        // Wait for the hotplugged disk to appear in the guest
+        assert!(wait_until(Duration::from_secs(10), || {
             guest
                 .ssh_command("lsblk | grep vdc | grep -c 16M")
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or_default(),
-            1
-        );
+                .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or_default() == 1)
+        }));
         // And check the block device can be read.
         guest
             .ssh_command("sudo dd if=/dev/vdc of=/dev/null bs=1M iflag=direct count=16")
@@ -2709,17 +2727,10 @@ pub(crate) fn _test_disk_hotplug(guest: &Guest, landlock_enabled: bool) {
 
         // Let's remove it the extra disk.
         assert!(remote_command(&api_socket, "remove-device", Some("test0")));
-        thread::sleep(std::time::Duration::new(5, 0));
-        // And check /dev/vdc is not there
-        assert_eq!(
-            guest
-                .ssh_command("lsblk | grep -c vdc.*16M || true")
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(1),
-            0
-        );
+        // Wait for the disk to disappear
+        assert!(wait_until(Duration::from_secs(10), || guest
+            .ssh_command("lsblk | grep -c vdc.*16M || true")
+            .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or(1) == 0)));
 
         // And add it back to validate unplug did work correctly.
         let (cmd_success, cmd_output) = remote_command_w_output(
@@ -2739,18 +2750,12 @@ pub(crate) fn _test_disk_hotplug(guest: &Guest, landlock_enabled: bool) {
                 .contains("{\"id\":\"test0\",\"bdf\":\"0000:00:06.0\"}")
         );
 
-        thread::sleep(std::time::Duration::new(10, 0));
-
-        // Check that /dev/vdc exists and the block size is 16M.
-        assert_eq!(
+        // Wait for the hotplugged disk to appear in the guest
+        assert!(wait_until(Duration::from_secs(10), || {
             guest
                 .ssh_command("lsblk | grep vdc | grep -c 16M")
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or_default(),
-            1
-        );
+                .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or_default() == 1)
+        }));
         // And check the block device can be read.
         guest
             .ssh_command("sudo dd if=/dev/vdc of=/dev/null bs=1M iflag=direct count=16")
@@ -2772,18 +2777,10 @@ pub(crate) fn _test_disk_hotplug(guest: &Guest, landlock_enabled: bool) {
 
         assert!(remote_command(&api_socket, "remove-device", Some("test0")));
 
-        thread::sleep(std::time::Duration::new(20, 0));
-
-        // Check device has gone away
-        assert_eq!(
-            guest
-                .ssh_command("lsblk | grep -c vdc.*16M || true")
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(1),
-            0
-        );
+        // Wait for the disk to disappear
+        assert!(wait_until(Duration::from_secs(20), || guest
+            .ssh_command("lsblk | grep -c vdc.*16M || true")
+            .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or(1) == 0)));
 
         guest.reboot_linux(1);
 
@@ -2931,18 +2928,12 @@ pub(crate) fn _test_net_hotplug(
             );
         }
 
-        thread::sleep(std::time::Duration::new(5, 0));
-
-        // 2 network interfaces + default localhost ==> 3 interfaces
-        assert_eq!(
+        // Wait for the hotplugged network interface to appear
+        assert!(wait_until(Duration::from_secs(10), || {
             guest
                 .ssh_command("ip -o link | wc -l")
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or_default(),
-            3
-        );
+                .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or_default() == 3)
+        }));
 
         // Test the same using the added network interface's IP
         assert_eq!(
@@ -2959,9 +2950,13 @@ pub(crate) fn _test_net_hotplug(
             3
         );
 
-        // Remove network
+        // Remove network and wait for it to disappear
         assert!(remote_command(&api_socket, "remove-device", Some("test0"),));
-        thread::sleep(std::time::Duration::new(5, 0));
+        assert!(wait_until(Duration::from_secs(10), || {
+            guest
+                .ssh_command("ip -o link | wc -l")
+                .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or_default() == 2)
+        }));
 
         // Add network
         let (cmd_success, cmd_output) = remote_command_w_output(
@@ -2994,18 +2989,12 @@ pub(crate) fn _test_net_hotplug(
             );
         }
 
-        thread::sleep(std::time::Duration::new(5, 0));
-
-        // 2 network interfaces + default localhost ==> 3 interfaces
-        assert_eq!(
+        // Wait for the hotplugged network interface to appear
+        assert!(wait_until(Duration::from_secs(10), || {
             guest
                 .ssh_command("ip -o link | wc -l")
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or_default(),
-            3
-        );
+                .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or_default() == 3)
+        }));
 
         guest.reboot_linux(0);
 
@@ -3176,17 +3165,14 @@ pub(crate) fn _test_pvpanic(guest: &Guest) {
         // Trigger guest a panic
         make_guest_panic(guest);
 
-        // Wait a while for guest
-        thread::sleep(std::time::Duration::new(10, 0));
-
+        // Wait for the panic event to be recorded
         let expected_sequential_events = [&MetaEvent {
             event: "panic".to_string(),
             device_id: None,
         }];
-        assert!(check_latest_events_exact(
-            &expected_sequential_events,
-            &event_path
-        ));
+        assert!(wait_until(Duration::from_secs(10), || {
+            check_latest_events_exact(&expected_sequential_events, &event_path)
+        }));
     });
 
     kill_child(&mut child);
@@ -3348,10 +3334,12 @@ pub(crate) fn _test_macvtap(
     let mut child = guest_command.capture_output().spawn().unwrap();
 
     if hotplug {
-        // Give some time to the VMM process to listen to the API
-        // socket. This is the only requirement to avoid the following
-        // call to ch-remote from failing.
-        thread::sleep(std::time::Duration::new(10, 0));
+        // Wait for the VMM process to listen to the API socket
+        assert!(wait_until(Duration::from_secs(10), || remote_command(
+            &api_socket,
+            "ping",
+            None
+        )));
         // Hotplug the virtio-net device
         let (cmd_success, cmd_output) =
             remote_command_w_output(&api_socket, "add-net", Some(&net_params));
@@ -3459,14 +3447,10 @@ pub(crate) fn _test_vdpa_block(guest: &Guest) {
                 .contains("{\"id\":\"myvdpa0\",\"bdf\":\"0001:00:01.0\"}")
         );
 
-        thread::sleep(std::time::Duration::new(10, 0));
-
-        // Check IOMMU setup
-        assert!(
-            guest
-                .does_device_vendor_pair_match("0x1057", "0x1af4")
-                .unwrap_or_default()
-        );
+        // Wait for the hotplugged device to appear
+        assert!(wait_until(Duration::from_secs(10), || guest
+            .does_device_vendor_pair_match("0x1057", "0x1af4")
+            .unwrap_or_default()));
         assert!(
             guest
                 .ssh_command("ls /sys/kernel/iommu_groups/*/devices")
@@ -3499,18 +3483,11 @@ pub(crate) fn _test_vdpa_block(guest: &Guest) {
         // Unplug the device
         let cmd_success = remote_command(&api_socket, "remove-device", Some("myvdpa0"));
         assert!(cmd_success);
-        thread::sleep(std::time::Duration::new(10, 0));
 
-        // Check /dev/vdd doesn't exist anymore
-        assert_eq!(
-            guest
-                .ssh_command("lsblk | grep -c vdd || true")
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(1),
-            0
-        );
+        // Wait for the device to disappear
+        assert!(wait_until(Duration::from_secs(10), || guest
+            .ssh_command("lsblk | grep -c vdd || true")
+            .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or(1) == 0)));
     });
 
     kill_child(&mut child);

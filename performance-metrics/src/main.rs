@@ -378,7 +378,7 @@ mod adjuster {
     }
 }
 
-const TEST_LIST: [PerformanceTest; 62] = [
+const TEST_LIST: [PerformanceTest; 100] = [
     PerformanceTest {
         name: "boot_time_ms",
         func_ptr: performance_boot_time,
@@ -1253,6 +1253,462 @@ const TEST_LIST: [PerformanceTest; 62] = [
         },
         unit_adjuster: adjuster::s_to_us,
     },
+    PerformanceTest {
+        name: "micro_block_qcow_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_random_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_random_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_random_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_random_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_write_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_write,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_write_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_write,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_punch_hole_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_punch_hole,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_punch_hole_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_punch_hole,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_fsync_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_fsync,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_fsync_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_fsync,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_backing_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_backing_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_backing_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_backing_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_cow_write_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_cow_write,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_cow_write_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_cow_write,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_compressed_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_compressed_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_compressed_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_compressed_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_multi_cluster_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_multi_cluster_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_multi_cluster_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_multi_cluster_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_l2_cache_miss_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_l2_cache_miss,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_l2_cache_miss_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_l2_cache_miss,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_batch_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_batch_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_batch_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_batch_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_random_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_random_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_random_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_random_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_multi_cluster_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_multi_cluster_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_multi_cluster_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_multi_cluster_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_backing_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_backing_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_backing_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_backing_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_compressed_read_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_compressed_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_compressed_read_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_compressed_read,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_write_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_write,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_write_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_write,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_l2_cache_miss_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_l2_cache_miss,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_async_l2_cache_miss_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_async_l2_cache_miss,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_batch_write_128_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_batch_write,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(128),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
+    PerformanceTest {
+        name: "micro_block_qcow_batch_write_256_us",
+        func_ptr: micro_bench_block::micro_bench_qcow_batch_write,
+        control: PerformanceTestControl {
+            test_timeout: 10,
+            test_iterations: 20,
+            warmup_iterations: 5,
+            num_ops: Some(256),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::s_to_us,
+    },
 ];
 
 fn run_test_with_timeout(
@@ -1297,8 +1753,9 @@ fn run_test_with_timeout(
 }
 
 fn cleanup_stale_processes() {
-    for proc in &["cloud-hypervisor", "iperf3", "ethr"] {
-        let _ = Command::new("pkill").args(["-9", "-f", proc]).status();
+    // "cloud-hyperviso" - process name truncated to 15 chars by the kernel
+    for proc in &["cloud-hyperviso", "iperf3", "ethr"] {
+        let _ = Command::new("pkill").args(["-9", proc]).status();
     }
     thread::sleep(Duration::from_secs(2));
 }
