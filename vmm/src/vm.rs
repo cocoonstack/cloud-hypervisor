@@ -18,6 +18,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::num::Wrapping;
 use std::ops::Deref;
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
@@ -68,6 +69,8 @@ use vm_device::Bus;
 use vm_memory::GuestMemory;
 #[cfg(feature = "tdx")]
 use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
+#[cfg(target_arch = "x86_64")]
+use vm_memory::Address;
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
@@ -1470,15 +1473,117 @@ impl Vm {
         cfg_if::cfg_if! {
             if #[cfg(feature = "sev_snp")] {
                 let entry_point = if cpu_manager.lock().unwrap().sev_snp_enabled() {
-                    EntryPoint { entry_addr: vm_memory::GuestAddress(res.vmsa_gpa), setup_header: None }
+                    EntryPoint { entry_addr: Some(vm_memory::GuestAddress(res.vmsa_gpa)), setup_header: None }
                 } else {
-                    EntryPoint {entry_addr: vm_memory::GuestAddress(res.vmsa.rip), setup_header: None }
+                    EntryPoint { entry_addr: Some(vm_memory::GuestAddress(res.vmsa.rip)), setup_header: None }
                 };
             } else {
-               let entry_point = EntryPoint { entry_addr: vm_memory::GuestAddress(res.vmsa.rip), setup_header: None };
+               let entry_point = EntryPoint { entry_addr: Some(vm_memory::GuestAddress(res.vmsa.rip)), setup_header: None };
             }
         };
         Ok(entry_point)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn load_legacy_firmware(
+        mut firmware: File,
+        memory_manager: &Arc<Mutex<MemoryManager>>,
+    ) -> Result<EntryPoint> {
+        warn!("Loading legacy RAW x86_64 firmware");
+
+        let size = firmware
+            .seek(SeekFrom::End(0))
+            .map_err(Error::FirmwareFile)?;
+
+        if size > 4 << 20 {
+            return Err(Error::FirmwareTooLarge);
+        }
+
+        let load_address = GuestAddress(4 << 30)
+            .checked_sub(size)
+            .ok_or(Error::FirmwareTooLarge)?;
+
+        info!(
+            "Loading RAW x86_64 firmware at 0x{:x} (size: {})",
+            load_address.raw_value(),
+            size
+        );
+
+        memory_manager
+            .lock()
+            .unwrap()
+            .add_ram_region(load_address, size as usize)
+            .map_err(Error::AllocateFirmwareMemory)?;
+
+        firmware
+            .seek(SeekFrom::Start(0))
+            .map_err(Error::FirmwareFile)?;
+        memory_manager
+            .lock()
+            .unwrap()
+            .guest_memory()
+            .memory()
+            .read_exact_volatile_from(load_address, &mut firmware.as_fd(), size as usize)
+            .map_err(Error::FirmwareLoad)?;
+
+        Ok(EntryPoint {
+            entry_addr: None,
+            setup_header: None,
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn load_firmware(
+        mut firmware: File,
+        memory_manager: Arc<Mutex<MemoryManager>>,
+    ) -> Result<EntryPoint> {
+        info!("Loading firmware");
+
+        let mem = {
+            let guest_memory = memory_manager.lock().as_ref().unwrap().guest_memory();
+            guest_memory.memory()
+        };
+
+        firmware
+            .seek(SeekFrom::Start(0))
+            .map_err(Error::FirmwareFile)?;
+        if let Ok(entry_addr) = linux_loader::loader::elf::Elf::load(
+            mem.deref(),
+            None,
+            &mut firmware,
+            Some(arch::layout::HIGH_RAM_START),
+        ) {
+            if let PvhEntryPresent(entry_addr) = entry_addr.pvh_boot_cap {
+                info!("PVH firmware loaded: entry_addr = 0x{:x}", entry_addr.0);
+                return Ok(EntryPoint {
+                    entry_addr: Some(entry_addr),
+                    setup_header: None,
+                });
+            }
+        }
+
+        firmware
+            .seek(SeekFrom::Start(0))
+            .map_err(Error::FirmwareFile)?;
+        if let Ok(entry_addr) = BzImage::load(
+            mem.deref(),
+            None,
+            &mut firmware,
+            Some(arch::layout::HIGH_RAM_START),
+        ) {
+            if entry_addr.setup_header.is_some() {
+                info!(
+                    "bzImage firmware loaded: entry_addr = 0x{:x}",
+                    entry_addr.kernel_load.0
+                );
+                return Ok(EntryPoint {
+                    entry_addr: Some(entry_addr.kernel_load),
+                    setup_header: entry_addr.setup_header,
+                });
+            }
+        }
+
+        Self::load_legacy_firmware(firmware, &memory_manager)
     }
 
     /// Loads the kernel or a firmware file.
@@ -1525,7 +1630,7 @@ impl Vm {
             // Use the PVH kernel entry point to boot the guest
             info!("PVH kernel loaded: entry_addr = 0x{:x}", entry_addr.0);
             Ok(EntryPoint {
-                entry_addr,
+                entry_addr: Some(entry_addr),
                 setup_header: None,
             })
         } else if entry_addr.setup_header.is_some() {
@@ -1535,7 +1640,7 @@ impl Vm {
                 entry_addr.kernel_load.0
             );
             Ok(EntryPoint {
-                entry_addr: entry_addr.kernel_load,
+                entry_addr: Some(entry_addr.kernel_load),
                 setup_header: entry_addr.setup_header,
             })
         } else {
@@ -1566,7 +1671,7 @@ impl Vm {
         match (&payload.firmware, &payload.kernel) {
             (Some(firmware), None) => {
                 let firmware = File::open(firmware).map_err(Error::FirmwareFile)?;
-                Self::load_kernel(firmware, None, memory_manager)
+                Self::load_firmware(firmware, memory_manager)
             }
             (None, Some(kernel)) => {
                 let kernel = File::open(kernel).map_err(Error::KernelFile)?;

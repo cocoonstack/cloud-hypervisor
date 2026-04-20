@@ -95,16 +95,20 @@ pub fn setup_msrs(vcpu: &dyn hypervisor::Vcpu) -> Result<()> {
 /// * `vcpu` - Structure for the VCPU that holds the VCPU's fd.
 /// * `entry_point` - Description of the boot entry to set up.
 pub fn setup_regs(vcpu: &dyn hypervisor::Vcpu, entry_point: EntryPoint) -> Result<()> {
+    let Some(entry_addr) = entry_point.entry_addr else {
+        return Ok(());
+    };
+
     let mut regs = vcpu.create_standard_regs();
     match entry_point.setup_header {
         None => {
             regs.set_rflags(0x0000000000000002u64);
-            regs.set_rip(entry_point.entry_addr.raw_value());
+            regs.set_rip(entry_addr.raw_value());
             regs.set_rbx(PVH_INFO_START.raw_value());
         }
         Some(_) => {
             regs.set_rflags(0x0000000000000002u64);
-            regs.set_rip(entry_point.entry_addr.raw_value());
+            regs.set_rip(entry_addr.raw_value());
             regs.set_rsp(BOOT_STACK_POINTER.raw_value());
             regs.set_rsi(ZERO_PAGE_START.raw_value());
         }

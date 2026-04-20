@@ -733,6 +733,10 @@ impl VirtioDevice for Net {
     }
 
     fn ack_features(&mut self, value: u64) {
+        info!(
+            "{}: acking virtio-net features delta=0x{value:016x}",
+            self.id
+        );
         self.common.ack_features(value);
     }
 
@@ -752,6 +756,10 @@ impl VirtioDevice for Net {
 
         let num_queues = queues.len();
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
+        info!(
+            "{}: activating virtio-net with {} queues acked_features=0x{:016x} event_idx={}",
+            self.id, num_queues, self.common.acked_features, event_idx
+        );
 
         // Recompute the barrier size from the queues that are actually activated.
         let has_ctrl_queue =

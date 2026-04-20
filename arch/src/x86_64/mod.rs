@@ -79,7 +79,7 @@ pub const _NSIG: i32 = 65;
 /// is to be used to configure the guest initial state.
 pub struct EntryPoint {
     /// Address in guest memory where the guest must start execution
-    pub entry_addr: GuestAddress,
+    pub entry_addr: Option<GuestAddress>,
     /// This field is used for bzImage to fill the zero page
     pub setup_header: Option<setup_header>,
 }
@@ -891,7 +891,9 @@ pub fn configure_vcpu(
     }
 
     regs::setup_msrs(vcpu).map_err(Error::MsrsConfiguration)?;
-    if let Some((kernel_entry_point, guest_memory)) = boot_setup {
+    if let Some((kernel_entry_point, guest_memory)) = boot_setup
+        && kernel_entry_point.entry_addr.is_some()
+    {
         regs::setup_regs(vcpu, kernel_entry_point).map_err(Error::RegsConfiguration)?;
         regs::setup_fpu(vcpu).map_err(Error::FpuConfiguration)?;
 

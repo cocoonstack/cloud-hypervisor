@@ -1053,9 +1053,9 @@ impl CpuManager {
         #[cfg(feature = "sev_snp")]
         if self.sev_snp_enabled {
             if let Some((kernel_entry_point, _)) = boot_setup {
-                vcpu.set_sev_control_register(
-                    kernel_entry_point.entry_addr.0 / crate::igvm::HV_PAGE_SIZE,
-                )?;
+                if let Some(entry_addr) = kernel_entry_point.entry_addr {
+                    vcpu.set_sev_control_register(entry_addr.0 / crate::igvm::HV_PAGE_SIZE)?;
+                }
             }
 
             // Traditional way to configure vcpu doesn't work for SEV-SNP guests.
@@ -3288,7 +3288,7 @@ mod unit_tests {
         setup_regs(
             vcpu.as_ref(),
             arch::EntryPoint {
-                entry_addr: vm_memory::GuestAddress(expected_regs.get_rip()),
+                entry_addr: Some(vm_memory::GuestAddress(expected_regs.get_rip())),
                 setup_header: None,
             },
         )
@@ -3315,7 +3315,7 @@ mod unit_tests {
         setup_regs(
             vcpu.as_ref(),
             arch::EntryPoint {
-                entry_addr: vm_memory::GuestAddress(expected_regs.get_rip()),
+                entry_addr: Some(vm_memory::GuestAddress(expected_regs.get_rip())),
                 setup_header: Some(setup_header {
                     ..Default::default()
                 }),

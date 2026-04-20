@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
 use byteorder::{ByteOrder, LittleEndian};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use virtio_queue::{Queue, QueueT};
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
@@ -125,6 +125,7 @@ pub fn get_vring_size(t: VringType, queue_size: u16) -> u64 {
 ///    le64 queue_avail;               // 0x28 // read-write
 ///    le64 queue_used;                // 0x30 // read-write
 pub struct VirtioPciCommonConfig {
+    pub id: String,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
     pub driver_status: Arc<AtomicU8>,
     pub config_generation: u8,
@@ -137,10 +138,12 @@ pub struct VirtioPciCommonConfig {
 
 impl VirtioPciCommonConfig {
     pub fn new(
+        id: String,
         state: VirtioPciCommonConfigState,
         access_platform: Option<Arc<dyn AccessPlatform>>,
     ) -> Self {
         VirtioPciCommonConfig {
+            id,
             access_platform,
             driver_status: Arc::new(AtomicU8::new(state.driver_status)),
             config_generation: state.config_generation,
@@ -236,7 +239,15 @@ impl VirtioPciCommonConfig {
     fn write_common_config_byte(&mut self, offset: u64, value: u8) {
         debug!("write_common_config_byte: offset 0x{offset:x}");
         match offset {
-            0x14 => self.driver_status.store(value, Ordering::Release),
+            0x14 => {
+                let old = self.driver_status.swap(value, Ordering::AcqRel);
+                if old != value {
+                    info!(
+                        "{}: virtio-pci common config: driver_status changed from 0x{old:02x} to 0x{value:02x}",
+                        self.id
+                    );
+                }
+            }
             _ => {
                 warn!("invalid virtio config byte write: 0x{offset:x}");
             }
@@ -285,6 +296,16 @@ impl VirtioPciCommonConfig {
             0x1c => self.with_queue_mut(queues, |q| {
                 let ready = value == 1;
                 q.set_ready(ready);
+                info!(
+                    "{}: virtio-pci common config: queue {} ready={} size={} desc=0x{:x} avail=0x{:x} used=0x{:x}",
+                    self.id,
+                    self.queue_select,
+                    ready,
+                    q.size(),
+                    q.desc_table(),
+                    q.avail_ring(),
+                    q.used_ring()
+                );
                 // Translate address of descriptor table and vrings.
                 if ready && let Some(access_platform) = &self.access_platform {
                     let desc_table = access_platform
@@ -354,6 +375,11 @@ impl VirtioPciCommonConfig {
             0x08 => self.driver_feature_select = value,
             0x0c => {
                 if self.driver_feature_select < 2 {
+                    info!(
+                        "{}: virtio-pci common config: ack_features page={} value=0x{value:08x}",
+                        self.id,
+                        self.driver_feature_select
+                    );
                     let mut locked_device = device.lock().unwrap();
                     locked_device
                         .ack_features(u64::from(value) << (self.driver_feature_select * 32));
@@ -452,6 +478,7 @@ mod unit_tests {
     #[test]
     fn write_base_regs() {
         let mut regs = VirtioPciCommonConfig {
+            id: "unit-test".to_string(),
             access_platform: None,
             driver_status: Arc::new(AtomicU8::new(0xaa)),
             config_generation: 0x55,
@@ -506,6 +533,7 @@ mod unit_tests {
         // Regression test: reading/writing queue_msix_vector (offset 0x1a)
         // with an out-of-bounds queue_select must not panic.
         let mut regs = VirtioPciCommonConfig {
+            id: "unit-test".to_string(),
             access_platform: None,
             driver_status: Arc::new(AtomicU8::new(0)),
             config_generation: 0,

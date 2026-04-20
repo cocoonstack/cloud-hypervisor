@@ -4283,23 +4283,45 @@ impl DeviceManager {
         }
 
         let device_type = virtio_device.lock().unwrap().device_type();
+        let legacy_interrupt_line = self.pci_segments[pci_segment_id as usize].pci_irq_slots
+            [pci_device_bdf.device() as usize] as u8;
+        let legacy_interrupt_group =
+            if let Some(legacy_interrupt_manager) = &self.legacy_interrupt_manager {
+                Some(
+                    legacy_interrupt_manager
+                        .create_group(LegacyIrqGroupConfig {
+                            irq: legacy_interrupt_line as InterruptIndex,
+                        })
+                        .map_err(DeviceManagerError::CreateInterruptGroup)?,
+                )
+            } else {
+                None
+            };
+
         let virtio_pci_device = Arc::new(Mutex::new(
             VirtioPciDevice::new(
                 id.clone(),
                 memory,
                 virtio_device,
                 msix_num,
+                legacy_interrupt_group,
+                Some(legacy_interrupt_line),
                 access_platform,
                 self.msi_interrupt_manager.as_ref(),
                 pci_device_bdf.into(),
                 self.activate_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
-                // All device types *except* virtio block devices should be allocated a 64-bit bar
-                // The block devices should be given a 32-bit BAR so that they are easily accessible
-                // to firmware without requiring excessive identity mapping.
-                // The exception being if not on the default PCI segment.
-                pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32,
+                // Prefer a 32-bit BAR for block and net on the default segment.
+                // Windows firmware/driver combinations appear more sensitive to
+                // resource placement for boot-critical/storage-adjacent devices.
+                // Keep the original 64-bit BAR behavior for other device types
+                // and for non-default PCI segments.
+                !(pci_segment_id == 0
+                    && matches!(
+                        VirtioDeviceType::from(device_type),
+                        VirtioDeviceType::Block | VirtioDeviceType::Net
+                    )),
                 dma_handler,
                 self.pending_activations.clone(),
                 vm_migration::snapshot_from_id(self.snapshot.as_ref(), id.as_str()),
