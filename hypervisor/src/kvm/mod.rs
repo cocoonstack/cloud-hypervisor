@@ -68,9 +68,9 @@ use crate::riscv64_reg_id;
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    KVM_CAP_HYPERV_SYNIC, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_GUESTDBG_USE_HW_BP,
-    KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS, MsrList, kvm_enable_cap,
-    kvm_msr_entry,
+    KVM_CAP_HYPERV_SYNIC, KVM_CAP_HYPERV_SYNIC2, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API,
+    KVM_GUESTDBG_USE_HW_BP, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS,
+    MsrList, kvm_enable_cap, kvm_msr_entry,
 };
 #[cfg(target_arch = "x86_64")]
 use x86_64::check_required_kvm_extensions;
@@ -878,6 +878,8 @@ impl vm::Vm for KvmVm {
             xsave_size,
             #[cfg(target_arch = "x86_64")]
             has_xcrs: self.check_extension(Cap::Xcrs),
+            #[cfg(target_arch = "x86_64")]
+            synic2_supported: self.check_extension(Cap::HypervSynic2),
             #[cfg(feature = "sev_snp")]
             vm_fd: self.fd.clone(),
             #[cfg(feature = "sev_snp")]
@@ -1762,6 +1764,8 @@ pub struct KvmVcpu {
     xsave_size: i32,
     #[cfg(target_arch = "x86_64")]
     has_xcrs: bool,
+    #[cfg(target_arch = "x86_64")]
+    synic2_supported: bool,
     #[cfg(feature = "sev_snp")]
     vm_fd: Arc<VmFd>,
     #[cfg(feature = "sev_snp")]
@@ -2223,8 +2227,19 @@ impl cpu::Vcpu for KvmVcpu {
         // emulated as it will influence later which MSRs should be saved.
         self.hyperv_synic.store(true, Ordering::Release);
 
+        // Prefer SynIC v2: KVM no longer clears the SIMP/SIEFP message and
+        // event flag pages on enable, which preserves any guest content the
+        // VMM has staged (matters for vm.restore where the guest expects
+        // its ring buffers intact). Fall back to v1 on older kernels —
+        // SynIC2 landed in Linux 4.18; capability is probed at vCPU
+        // construction time via the VM fd.
+        let cap_id = if self.synic2_supported {
+            KVM_CAP_HYPERV_SYNIC2
+        } else {
+            KVM_CAP_HYPERV_SYNIC
+        };
         let cap = kvm_enable_cap {
-            cap: KVM_CAP_HYPERV_SYNIC,
+            cap: cap_id,
             ..Default::default()
         };
         self.fd

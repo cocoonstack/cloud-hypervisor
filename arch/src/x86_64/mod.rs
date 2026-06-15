@@ -872,7 +872,8 @@ fn required_common_cpuid_updates(
                    | (1 << 11), // AccessFrequencyMsrs (TSC/APIC frequency MSRs)
             edx: (1 << 3) // CPU dynamic partitioning
                    | (1 << 4) // FastHypercall (XMM register hypercall input)
-                   | (1 << 8), // ExtendedGvaRangesForFlushVirtualAddressList
+                   | (1 << 8) // ExtendedGvaRangesForFlushVirtualAddressList
+                   | (1 << 19), // StimerDirectModeAvailable
             ..Default::default()
         });
         cpuid.push(CpuIdEntry {
