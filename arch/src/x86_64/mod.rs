@@ -51,6 +51,16 @@ const TSC_DEADLINE_TIMER_ECX_BIT: u8 = 24; // tsc deadline timer ecx bit.
 const HYPERVISOR_ECX_BIT: u8 = 31; // Hypervisor ecx bit.
 const VMX_ECX_BIT: u8 = 5; // VMX for Intel
 const SVM_ECX_BIT: u8 = 2; // SVM for AMD
+
+// Hyper-V Enlightened VMCS, for nested Hyper-V / WSL2 on Intel.
+// Recommended bit in HV_CPUID_ENLIGHTMENT_INFO (0x40000004) EAX.
+const HV_ENLIGHTENED_VMCS_RECOMMENDED_BIT: u32 = 14;
+// HV_CPUID_NESTED_FEATURES (0x4000000A) EAX: low 16 bits encode the supported
+// Enlightened VMCS version range; we report v1 only (low=high=1).
+const HV_ENLIGHTENED_VMCS_VERSION: u32 = 1;
+// HV_CPUID_NESTED_FEATURES (0x4000000A) EAX feature bits.
+const HV_NESTED_DIRECT_FLUSH_BIT: u32 = 17;
+const HV_NESTED_MSR_BITMAP_BIT: u32 = 19;
 const MTRR_EDX_BIT: u8 = 12; // Hypervisor ecx bit.
 const INVARIANT_TSC_EDX_BIT: u8 = 8; // Invariant TSC bit on 0x8000_0007 EDX
 const AMX_BF16: u8 = 22; // AMX tile computation on bfloat16 numbers
@@ -983,6 +993,33 @@ pub fn configure_vcpu(
                                * APIC_BUS_CYCLE_NS */
                 ..Default::default()
             });
+        }
+    }
+
+    // Enlightened VMCS lets a Hyper-V guest run as an L1 hypervisor (nested
+    // Hyper-V / WSL2) over KVM. It is Intel-only and only meaningful when both
+    // Hyper-V enlightenments and nested virtualization are enabled. KVM accepts
+    // the Hyper-V nested-features CPUID leaf (0x4000000A) only after the eVMCS
+    // capability has been enabled on the vCPU, so enable it before set_cpuid2.
+    let evmcs = kvm_hyperv && nested && matches!(cpu_vendor, CpuVendor::Intel);
+    if evmcs {
+        vcpu.enable_hyperv_enlightened_vmcs()
+            .map_err(|e| Error::SetSupportedCpusFailed(e.into()))?;
+
+        for entry in &mut cpuid {
+            match entry.function {
+                // HV_CPUID_ENLIGHTMENT_INFO: tell the guest eVMCS is recommended.
+                0x4000_0004 => entry.eax |= 1 << HV_ENLIGHTENED_VMCS_RECOMMENDED_BIT,
+                // HV_CPUID_NESTED_FEATURES: advertise the supported eVMCS version
+                // (low 16 bits) plus the nested enlightenments KVM implements.
+                0x4000_000a => {
+                    entry.eax = HV_ENLIGHTENED_VMCS_VERSION
+                        | (HV_ENLIGHTENED_VMCS_VERSION << 8)
+                        | (1 << HV_NESTED_DIRECT_FLUSH_BIT)
+                        | (1 << HV_NESTED_MSR_BITMAP_BIT);
+                }
+                _ => {}
+            }
         }
     }
 

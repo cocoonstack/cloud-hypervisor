@@ -68,9 +68,9 @@ use crate::riscv64_reg_id;
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    KVM_CAP_HYPERV_SYNIC, KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_GUESTDBG_USE_HW_BP,
-    KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS, MsrList, kvm_enable_cap,
-    kvm_msr_entry,
+    KVM_CAP_HYPERV_ENLIGHTENED_VMCS, KVM_CAP_HYPERV_SYNIC, KVM_CAP_SPLIT_IRQCHIP,
+    KVM_CAP_X2APIC_API, KVM_GUESTDBG_USE_HW_BP, KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK,
+    KVM_X2APIC_API_USE_32BIT_IDS, MsrList, kvm_enable_cap, kvm_msr_entry,
 };
 #[cfg(target_arch = "x86_64")]
 use x86_64::check_required_kvm_extensions;
@@ -2230,6 +2230,25 @@ impl cpu::Vcpu for KvmVcpu {
         self.fd
             .enable_cap(&cap)
             .map_err(|e| cpu::HypervisorCpuError::EnableHyperVSyncIc(e.into()))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// X86 specific call to enable HyperV Enlightened VMCS
+    ///
+    fn enable_hyperv_enlightened_vmcs(&self) -> cpu::Result<()> {
+        // A Hyper-V guest acting as an L1 hypervisor (nested Hyper-V / WSL2)
+        // drives KVM through the Enlightened VMCS layout rather than the
+        // architectural VMCS. args[0] receives the eVMCS version supported by
+        // KVM; we don't pin a version here (KVM guarantees at least v1, which
+        // is what the guest negotiates via CPUID 0x4000000A).
+        let cap = kvm_enable_cap {
+            cap: KVM_CAP_HYPERV_ENLIGHTENED_VMCS,
+            ..Default::default()
+        };
+        self.fd
+            .enable_cap(&cap)
+            .map_err(|e| cpu::HypervisorCpuError::EnableHyperVEnlightenedVmcs(e.into()))
     }
 
     ///
