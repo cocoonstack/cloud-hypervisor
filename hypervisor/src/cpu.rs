@@ -212,6 +212,10 @@ pub enum HypervisorCpuError {
     ///
     #[error("Failed to enable HyperV SynIC")]
     EnableHyperVSyncIc(#[source] anyhow::Error),
+    /// Enabling HyperV Enlightened VMCS error
+    ///
+    #[error("Failed to enable HyperV Enlightened VMCS")]
+    EnableHyperVEnlightenedVmcs(#[source] anyhow::Error),
     ///
     /// Getting AArch64 core register error
     ///
@@ -415,6 +419,19 @@ pub trait Vcpu: Send + Sync {
     /// X86 specific call to enable HyperV SynIC
     ///
     fn enable_hyperv_synic(&self) -> Result<()>;
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// X86 specific call to enable HyperV Enlightened VMCS for nested guests.
+    ///
+    /// Enlightened VMCS is the paravirtualized L0<->L1 protocol that a Hyper-V
+    /// guest (acting as an L1 hypervisor, e.g. for WSL2 or nested Hyper-V) uses
+    /// instead of the architectural VMCS layout. It is Intel-only. The default
+    /// implementation is a no-op so backends that do not need it (or handle
+    /// nesting natively, like MSHV) are unaffected.
+    ///
+    fn enable_hyperv_enlightened_vmcs(&self) -> Result<()> {
+        Ok(())
+    }
     #[cfg(target_arch = "x86_64")]
     ///
     /// X86 specific call to retrieve the CPUID registers.
