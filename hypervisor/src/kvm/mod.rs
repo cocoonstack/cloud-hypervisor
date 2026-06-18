@@ -2253,13 +2253,12 @@ impl cpu::Vcpu for KvmVcpu {
     /// X86 specific call to enable HyperV Enlightened VMCS
     ///
     fn enable_hyperv_enlightened_vmcs(&self) -> cpu::Result<()> {
-        // A Hyper-V guest acting as an L1 hypervisor (nested Hyper-V / WSL2)
-        // drives KVM through the Enlightened VMCS layout rather than the
-        // architectural VMCS. args[0] receives the eVMCS version supported by
-        // KVM; we don't pin a version here (KVM guarantees at least v1, which
-        // is what the guest negotiates via CPUID 0x4000000A).
+        // KVM copy_to_user()s the supported eVMCS version into args[0], so it must
+        // point at writable memory — a zero args[0] makes the ioctl fail EFAULT.
+        let mut evmcs_version: u64 = 0;
         let cap = kvm_enable_cap {
             cap: KVM_CAP_HYPERV_ENLIGHTENED_VMCS,
+            args: [&mut evmcs_version as *mut u64 as u64, 0, 0, 0],
             ..Default::default()
         };
         self.fd
