@@ -882,8 +882,8 @@ fn required_common_cpuid_updates(
                    | (1 << 11), // AccessFrequencyMsrs (TSC/APIC frequency MSRs)
             edx: (1 << 3) // CPU dynamic partitioning
                    | (1 << 4) // FastHypercall (XMM register hypercall input)
-                   | (1 << 8) // ExtendedGvaRangesForFlushVirtualAddressList
-                   | (1 << 19), // StimerDirectModeAvailable
+                   // bit 19 StimerDirectModeAvailable omitted: on nested KVM the direct-vector stimer never arrives and Windows hangs in early boot; SynIC-message delivery (no bit) works.
+                   | (1 << 8), // ExtendedGvaRangesForFlushVirtualAddressList
             ..Default::default()
         });
         cpuid.push(CpuIdEntry {

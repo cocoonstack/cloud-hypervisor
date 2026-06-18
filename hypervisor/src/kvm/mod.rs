@@ -68,7 +68,7 @@ use crate::riscv64_reg_id;
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    KVM_CAP_HYPERV_ENLIGHTENED_VMCS, KVM_CAP_HYPERV_SYNIC, KVM_CAP_HYPERV_SYNIC2,
+    KVM_CAP_HYPERV_ENLIGHTENED_VMCS, KVM_CAP_HYPERV_SYNIC,
     KVM_CAP_SPLIT_IRQCHIP, KVM_CAP_X2APIC_API, KVM_GUESTDBG_USE_HW_BP,
     KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK, KVM_X2APIC_API_USE_32BIT_IDS, MsrList, kvm_enable_cap,
     kvm_msr_entry,
@@ -2228,17 +2228,10 @@ impl cpu::Vcpu for KvmVcpu {
         // emulated as it will influence later which MSRs should be saved.
         self.hyperv_synic.store(true, Ordering::Release);
 
-        // Prefer SynIC v2: KVM no longer clears the SIMP/SIEFP message and
-        // event flag pages on enable, which preserves any guest content the
-        // VMM has staged (matters for vm.restore where the guest expects
-        // its ring buffers intact). Fall back to v1 on older kernels —
-        // SynIC2 landed in Linux 4.18; capability is probed at vCPU
-        // construction time via the VM fd.
-        let cap_id = if self.synic2_supported {
-            KVM_CAP_HYPERV_SYNIC2
-        } else {
-            KVM_CAP_HYPERV_SYNIC
-        };
+        // SynIC v1: v2 (which skips clearing SIMP/SIEFP on enable) hangs a Windows guest in early
+        // boot on a nested KVM host; v1 works. synic2_supported is still probed but not used here.
+        let _ = self.synic2_supported;
+        let cap_id = KVM_CAP_HYPERV_SYNIC;
         let cap = kvm_enable_cap {
             cap: cap_id,
             ..Default::default()
