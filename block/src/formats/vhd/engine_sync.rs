@@ -10,16 +10,15 @@ use vmm_sys_util::eventfd::EventFd;
 
 use crate::AlignedFile;
 use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult};
-use crate::formats::raw::worker::sync::RawSync;
-use crate::formats::vhd::worker::common::validate_operation_bounds;
+use crate::formats::raw::engine_sync::RawSync;
 
-pub struct FixedVhdSync {
+pub(super) struct FixedVhdSync {
     raw_file_sync: RawSync,
     size: u64,
 }
 
 impl FixedVhdSync {
-    pub fn new(raw_file: AlignedFile, size: u64) -> Self {
+    pub(super) fn new(raw_file: AlignedFile, size: u64) -> Self {
         FixedVhdSync {
             raw_file_sync: RawSync::new(raw_file),
             size,
@@ -33,7 +32,7 @@ impl AsyncIo for FixedVhdSync {
     }
 
     fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
-        validate_operation_bounds(&op, self.size)?;
+        op.validate_bounds(self.size)?;
         self.raw_file_sync.submit_data_operation(op)
     }
 

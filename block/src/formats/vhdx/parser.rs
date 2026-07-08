@@ -13,16 +13,11 @@ use std::result;
 use remain::sorted;
 use thiserror::Error;
 
-use self::bat::{BatEntry, VhdxBatError};
-use self::header::{RegionInfo, RegionTableEntry, VhdxHeader, VhdxHeaderError};
-use self::io::VhdxIoError;
-use self::metadata::{DiskSpec, VhdxMetadataError};
+use super::bat::{BatEntry, VhdxBatError};
+use super::header::{self, RegionInfo, RegionTableEntry, VhdxHeader, VhdxHeaderError};
+use super::io::{self, VhdxIoError};
+use super::metadata::{DiskSpec, VhdxMetadataError};
 use crate::aligned_file::AlignedFile;
-
-mod bat;
-mod header;
-mod io;
-mod metadata;
 
 #[sorted]
 #[derive(Error, Debug)]
@@ -43,7 +38,7 @@ pub enum VhdxError {
     WriteFailed(#[source] VhdxIoError),
 }
 
-pub type Result<T> = result::Result<T, VhdxError>;
+pub(super) type Result<T> = result::Result<T, VhdxError>;
 
 #[derive(Debug)]
 pub struct Vhdx {
@@ -239,34 +234,16 @@ impl AsRawFd for Vhdx {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::process::Command;
-
-    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
-
-    /// Generate a small dynamic VHDX with `qemu-img`. Returns `None` (and the
-    /// test is skipped) when `qemu-img` is unavailable, e.g. in minimal CI.
-    fn dynamic_vhdx(size_mib: u64) -> Option<TempFile> {
-        let tf = TempFile::new().unwrap();
-        let path = tf.as_path();
-        let status = Command::new("qemu-img")
-            .args(["create", "-f", "vhdx", "-o", "subformat=dynamic"])
-            .arg(path)
-            .arg(format!("{size_mib}M"))
-            .status();
-        match status {
-            Ok(s) if s.success() => Some(tf),
-            _ => None,
-        }
-    }
+    use crate::formats::vhdx::test_util::create_dynamic_vhdx;
 
     /// An unaligned sector write under a forced O_DIRECT alignment must go
     /// through `AlignedFile`'s read-modify-write bounce (the data block and the
     /// BAT update both land at unaligned host offsets) and read back intact.
     #[test]
     fn unaligned_write_is_rmw() {
-        let Some(tf) = dynamic_vhdx(16) else {
+        let Some(tf) = create_dynamic_vhdx(16) else {
             eprintln!("skipping unaligned_write_is_rmw: qemu-img unavailable");
             return;
         };
@@ -299,7 +276,7 @@ mod tests {
 
     #[test]
     fn header_update_survives_reopen() {
-        let Some(tf) = dynamic_vhdx(16) else {
+        let Some(tf) = create_dynamic_vhdx(16) else {
             eprintln!("skipping header_update_survives_reopen: qemu-img unavailable");
             return;
         };

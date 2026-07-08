@@ -9,17 +9,23 @@
 //! Provides [`VhdxDisk`], the `DiskFile` wrapper for dynamic VHDX
 //! images.
 
-pub mod internal;
-pub(crate) mod worker;
+mod bat;
+mod engine_sync;
+mod header;
+mod io;
+mod metadata;
+mod parser;
+#[cfg(test)]
+mod test_util;
 
 use std::fs::File;
-use std::io;
+use std::io::Error as IoError;
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Mutex};
 
-pub use internal::{Vhdx, VhdxError};
+pub use parser::{Vhdx, VhdxError};
 
-use self::worker::sync::VhdxSync;
+use self::engine_sync::VhdxSync;
 use crate::async_io::{AsyncIo, BorrowedDiskFd, DiskFileError};
 use crate::error::{BlockError, BlockErrorKind, BlockResult, ErrorOp};
 use crate::{Error, disk_file};
@@ -90,7 +96,7 @@ impl disk_file::Resizable for VhdxDisk {
     fn resize(&mut self, _size: u64) -> BlockResult<()> {
         Err(BlockError::new(
             BlockErrorKind::UnsupportedFeature,
-            DiskFileError::ResizeError(io::Error::other("resize not supported for VHDX")),
+            DiskFileError::ResizeError(IoError::other("resize not supported for VHDX")),
         )
         .with_op(ErrorOp::Resize))
     }
@@ -106,6 +112,7 @@ impl disk_file::AsyncDiskFile for VhdxDisk {
     }
 
     fn create_async_io(&self, _ring_depth: u32) -> BlockResult<Box<dyn AsyncIo>> {
-        Ok(Box::new(VhdxSync::new(Arc::clone(&self.vhdx_file))))
+        let size = self.vhdx_file.lock().unwrap().virtual_disk_size();
+        Ok(Box::new(VhdxSync::new(Arc::clone(&self.vhdx_file), size)))
     }
 }
