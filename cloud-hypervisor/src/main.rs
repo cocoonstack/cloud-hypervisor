@@ -454,7 +454,7 @@ fn get_cli_options_sorted(
         Arg::new("seccomp")
             .long("seccomp")
             .num_args(1)
-            .value_parser(["true", "false", "log"])
+            .value_parser(["true", "false", "log", "errno"])
             .default_value("true"),
         Arg::new("serial")
             .long("serial")
@@ -588,6 +588,7 @@ fn start_vmm(
             "true" => SeccompAction::Trap,
             "false" => SeccompAction::Allow,
             "log" => SeccompAction::Log,
+            "errno" => SeccompAction::Errno(libc::EPERM as u32),
             val => {
                 // The user providing an invalid value will be rejected
                 panic!("Invalid parameter {val} for \"--seccomp\" flag");
@@ -894,6 +895,8 @@ fn expand_fdtable() -> Result<(), FdTableError> {
 }
 
 fn main() {
+    #[cfg(feature = "tdx")]
+    compile_error!("Feature 'tdx' is broken.");
     #[cfg(all(feature = "tdx", feature = "sev_snp"))]
     compile_error!("Feature 'tdx' and 'sev_snp' are mutually exclusive.");
     #[cfg(all(feature = "sev_snp", not(target_arch = "x86_64")))]
