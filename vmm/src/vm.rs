@@ -1406,6 +1406,46 @@ impl Vm {
             vm_config.lock().unwrap().cpus.max_phys_bits,
         );
 
+        let mut memory_restore_mode = memory_restore_mode.unwrap_or_default();
+        if memory_restore_mode == MemoryRestoreMode::Mmap {
+            let config = vm_config.lock().unwrap();
+            // These consumers stay live over a private-anonymous region that the
+            // overlay silently turns file-backed, so keep them on the eager copy:
+            // passthrough pins the original mapping; virtio-mem/balloon
+            // MADV_DONTNEED would refault snapshot bytes on resizable RAM; KSM
+            // merges only anonymous pages; and per-zone reserve/NUMA cannot be
+            // replayed on the overlaid VMA. shared/hugepage/file-backed zones need
+            // no check here — they are already rejected per region by file_offset.
+            let mem = &config.memory;
+            let passthrough = config.devices.as_ref().is_some_and(|d| !d.is_empty())
+                || config.user_devices.as_ref().is_some_and(|d| !d.is_empty());
+            // pvmemcontrol issues MADV_FREE/MADV_MERGEABLE against guest RAM, which behave differently on a file-backed overlay than on anonymous RAM.
+            #[cfg(feature = "pvmemcontrol")]
+            let pvmemcontrol = config.pvmemcontrol.is_some();
+            #[cfg(not(feature = "pvmemcontrol"))]
+            let pvmemcontrol = false;
+            let unsupported_zone = mem.zones.as_ref().is_some_and(|zones| {
+                zones.iter().any(|z| {
+                    z.host_numa_node.is_some()
+                        || z.hotplug_size.is_some()
+                        || z.hotplugged_size.is_some()
+                        || z.reserve
+                        || z.mergeable
+                })
+            });
+            if passthrough
+                || pvmemcontrol
+                || mem.mergeable
+                || mem.hotplug_size.is_some()
+                || unsupported_zone
+            {
+                warn!(
+                    "memory_restore_mode=mmap needs non-resizable private RAM without passthrough, NUMA binding or KSM; using copy"
+                );
+                memory_restore_mode = MemoryRestoreMode::Copy;
+            }
+        }
+
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
                 MemoryManager::new_from_snapshot(
@@ -1414,7 +1454,7 @@ impl Vm {
                     &vm_config.lock().unwrap().memory.clone(),
                     source_url,
                     prefault.unwrap_or(false),
-                    memory_restore_mode.unwrap_or_default(),
+                    memory_restore_mode,
                     phys_bits,
                     &exit_evt,
                 )

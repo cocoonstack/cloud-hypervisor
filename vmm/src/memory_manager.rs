@@ -395,6 +395,10 @@ pub enum Error {
     #[error("Error copying snapshot into region")]
     SnapshotCopy(#[source] GuestMemoryError),
 
+    /// Error mapping snapshot file over guest RAM
+    #[error("Error mapping snapshot file over guest RAM")]
+    SnapshotMmap(#[source] io::Error),
+
     /// Failed to allocate MMIO address
     #[error("Failed to allocate MMIO address")]
     AllocateMmioAddress,
@@ -907,6 +911,50 @@ impl MemoryManager {
         }
 
         Ok(())
+    }
+
+    /// Restore guest memory by mapping the snapshot file copy-on-write over
+    /// the still-unconsumed anonymous guest mappings: nothing is read up
+    /// front, pages fault in from the page cache (shared across VMs restored
+    /// from the same snapshot), and file holes read back as zeros. Runs
+    /// before any KVM memslot, vhost-user or VFIO consumer sees the mapping,
+    /// so the mapping-identity concerns of an after-the-fact overlay do not
+    /// apply. Falls back to the eager copy whenever a range cannot be mapped
+    /// safely. The snapshot file must remain on disk for the VM lifetime.
+    fn mmap_saved_regions(
+        &mut self,
+        file_path: PathBuf,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        if saved_regions.is_empty() {
+            return Ok(());
+        }
+        let guest_memory = self.guest_memory.memory();
+        if !mmap_restore_compatible(&guest_memory, saved_regions) {
+            info!("guest RAM unsuitable for mmap restore; falling back to copy");
+            drop(guest_memory);
+            return self.fill_saved_regions(file_path, saved_regions);
+        }
+        let memory_file = OpenOptions::new()
+            .read(true)
+            .open(file_path)
+            .map_err(Error::SnapshotOpen)?;
+        // A range mapped past EOF faults SIGBUS at run time, not restore time; reject a short/truncated file up front.
+        let mapped_len: u64 = saved_regions.regions().iter().map(|r| r.length).sum();
+        let file_len = memory_file.metadata().map_err(Error::SnapshotOpen)?.len();
+        if file_len < mapped_len {
+            return Err(Error::SnapshotMmap(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "snapshot memory file is shorter than the saved ranges",
+            )));
+        }
+        mmap_saved_ranges(
+            &guest_memory,
+            &memory_file,
+            saved_regions,
+            self.reserve,
+            self.thp,
+        )
     }
 
     /// Restore guest memory using userfaultfd for lazy demand paging.
@@ -1905,16 +1953,20 @@ impl MemoryManager {
                 Default::default(),
             )?;
 
-            if memory_restore_mode == MemoryRestoreMode::OnDemand {
-                mm.lock().unwrap().restore_by_uffd(
+            match memory_restore_mode {
+                MemoryRestoreMode::OnDemand => mm.lock().unwrap().restore_by_uffd(
                     &memory_file_path,
                     &mem_snapshot.memory_ranges,
                     exit_evt,
-                )?;
-            } else {
-                mm.lock()
+                )?,
+                MemoryRestoreMode::Mmap => mm
+                    .lock()
                     .unwrap()
-                    .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+                    .mmap_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
+                MemoryRestoreMode::Copy => mm
+                    .lock()
+                    .unwrap()
+                    .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
             }
 
             Ok(mm)
@@ -3389,5 +3441,203 @@ impl Migratable for MemoryManager {
             table.extend(sub_table);
         }
         Ok(table)
+    }
+}
+
+/// Reports whether every saved range is page-aligned and lies wholly inside a
+/// single plain private-anonymous guest region — the preconditions for a
+/// MAP_FIXED overlay. A file-backed region (shared or hugepage RAM, whether
+/// global or per-zone) is rejected: overlaying it would leave stale
+/// mapping metadata that a later snapshot or a vhost-user/VFIO consumer
+/// resolves against the original fd instead of the mapped snapshot.
+fn mmap_restore_compatible(
+    guest_memory: &GuestMemoryMmap,
+    saved_regions: &MemoryRangeTable,
+) -> bool {
+    // SAFETY: sysconf(_SC_PAGESIZE) has no failure mode relevant here.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let mut file_offset: u64 = 0;
+    for range in saved_regions.regions() {
+        if !file_offset.is_multiple_of(page_size)
+            || !range.gpa.is_multiple_of(page_size)
+            || !range.length.is_multiple_of(page_size)
+        {
+            return false;
+        }
+        let Some(end) = range.gpa.checked_add(range.length) else {
+            return false;
+        };
+        let ok = guest_memory
+            .find_region(GuestAddress(range.gpa))
+            .is_some_and(|r| {
+                r.file_offset().is_none() && end <= r.start_addr().raw_value() + r.len()
+            });
+        if !ok {
+            return false;
+        }
+        let Some(next) = file_offset.checked_add(range.length) else {
+            return false;
+        };
+        file_offset = next;
+    }
+    true
+}
+
+/// Maps each saved range from the snapshot file over its guest RAM window,
+/// re-applying the region's reservation and THP policy; caller must have
+/// validated the ranges with [`mmap_restore_compatible`].
+fn mmap_saved_ranges(
+    guest_memory: &GuestMemoryMmap,
+    memory_file: &File,
+    saved_regions: &MemoryRangeTable,
+    reserve: bool,
+    thp: bool,
+) -> Result<(), Error> {
+    let reserve_flag = if reserve { 0 } else { libc::MAP_NORESERVE };
+    let mut file_offset: u64 = 0;
+    for range in saved_regions.regions() {
+        let host_addr = guest_memory
+            .get_host_address(GuestAddress(range.gpa))
+            .map_err(|e| Error::SnapshotMmap(io::Error::other(e)))?;
+        let length = range.length as usize;
+        // SAFETY: the target window is page-aligned, wholly inside a live
+        // GuestRegionMmap private anonymous mapping that no KVM slot, device
+        // or thread consumes yet, so the MAP_FIXED replacement is atomic and
+        // cannot clobber foreign mappings; the fd stays valid for the call.
+        let ret = unsafe {
+            libc::mmap(
+                host_addr.cast(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | reserve_flag,
+                memory_file.as_raw_fd(),
+                file_offset as libc::off_t,
+            )
+        };
+        if ret == libc::MAP_FAILED {
+            return Err(Error::SnapshotMmap(io::Error::last_os_error()));
+        }
+        if thp {
+            // SAFETY: ret/length name the private mapping just installed above.
+            let adv = unsafe { libc::madvise(ret, length, libc::MADV_HUGEPAGE) };
+            if adv != 0 {
+                warn!(
+                    "mmap restore: MADV_HUGEPAGE failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        file_offset = file_offset.checked_add(range.length).ok_or_else(|| {
+            Error::SnapshotMmap(io::Error::other("snapshot range file offset overflow"))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
+
+    use super::*;
+
+    fn page_size() -> u64 {
+        // SAFETY: sysconf(_SC_PAGESIZE) has no failure mode relevant here.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    }
+
+    #[test]
+    fn mmap_restore_maps_data_and_reads_holes_as_zero() {
+        let page = page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (2 * page) as usize)]).unwrap();
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xabu8; page as usize]).unwrap();
+        file.set_len(2 * page).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 2 * page,
+        });
+
+        assert!(mmap_restore_compatible(&gm, &table));
+        mmap_saved_ranges(&gm, &file, &table, false, false).unwrap();
+
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page - 1)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(2 * page - 1)).unwrap(), 0);
+
+        // CoW: guest writes must not reach the file.
+        gm.write_obj::<u8>(0x5a, GuestAddress(0)).unwrap();
+        let mut back = [0u8; 1];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut back).unwrap();
+        assert_eq!(back[0], 0xab);
+    }
+
+    #[test]
+    fn mmap_restore_rejects_unaligned_or_out_of_region_ranges() {
+        let page = page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), page as usize)]).unwrap();
+
+        let mut unaligned = MemoryRangeTable::default();
+        unaligned.push(MemoryRange {
+            gpa: 1,
+            length: page,
+        });
+        assert!(!mmap_restore_compatible(&gm, &unaligned));
+
+        let mut spanning = MemoryRangeTable::default();
+        spanning.push(MemoryRange {
+            gpa: 0,
+            length: 2 * page,
+        });
+        assert!(!mmap_restore_compatible(&gm, &spanning));
+    }
+
+    #[test]
+    fn mmap_restore_rejects_file_backed_region() {
+        let page = page_size();
+        let backing = tempfile::tempfile().unwrap();
+        backing.set_len(page).unwrap();
+        let region = MmapRegion::build(
+            Some(FileOffset::new(backing, 0)),
+            page as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+        )
+        .unwrap();
+        let gm = GuestMemoryMmap::from_regions(vec![
+            GuestRegionMmap::new(region, GuestAddress(0)).unwrap(),
+        ])
+        .unwrap();
+
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: page,
+        });
+        assert!(!mmap_restore_compatible(&gm, &table));
+    }
+
+    #[test]
+    fn mmap_restore_honors_reserve_and_thp() {
+        let page = page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), page as usize)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&vec![0xcdu8; page as usize]).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: page,
+        });
+        mmap_saved_ranges(&gm, &file, &table, true, true).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
     }
 }
