@@ -1409,17 +1409,13 @@ impl Vm {
         let mut memory_restore_mode = memory_restore_mode.unwrap_or_default();
         if memory_restore_mode == MemoryRestoreMode::Mmap {
             let config = vm_config.lock().unwrap();
-            // These consumers stay live over a private-anonymous region that the
-            // overlay silently turns file-backed, so keep them on the eager copy:
-            // passthrough pins the original mapping; virtio-mem/balloon
-            // MADV_DONTNEED would refault snapshot bytes on resizable RAM; KSM
-            // merges only anonymous pages; and per-zone reserve/NUMA cannot be
-            // replayed on the overlaid VMA. shared/hugepage/file-backed zones need
-            // no check here — they are already rejected per region by file_offset.
+            // Consumers that rely on guest RAM staying anonymous (DMA pinning,
+            // MADV_DONTNEED zeroing, KSM, per-zone reserve/NUMA replay) keep the
+            // eager copy; shared/hugepage zones are already rejected per region.
             let mem = &config.memory;
             let passthrough = config.devices.as_ref().is_some_and(|d| !d.is_empty())
                 || config.user_devices.as_ref().is_some_and(|d| !d.is_empty());
-            // pvmemcontrol issues MADV_FREE/MADV_MERGEABLE against guest RAM, which behave differently on a file-backed overlay than on anonymous RAM.
+            // pvmemcontrol madvises guest RAM as if anonymous.
             #[cfg(feature = "pvmemcontrol")]
             let pvmemcontrol = config.pvmemcontrol.is_some();
             #[cfg(not(feature = "pvmemcontrol"))]

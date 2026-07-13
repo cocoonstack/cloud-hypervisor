@@ -914,13 +914,10 @@ impl MemoryManager {
     }
 
     /// Restore guest memory by mapping the snapshot file copy-on-write over
-    /// the still-unconsumed anonymous guest mappings: nothing is read up
-    /// front, pages fault in from the page cache (shared across VMs restored
-    /// from the same snapshot), and file holes read back as zeros. Runs
-    /// before any KVM memslot, vhost-user or VFIO consumer sees the mapping,
-    /// so the mapping-identity concerns of an after-the-fact overlay do not
-    /// apply. Falls back to the eager copy whenever a range cannot be mapped
-    /// safely. The snapshot file must remain on disk for the VM lifetime.
+    /// the anonymous guest mappings — before any KVM memslot or device
+    /// consumes them, so overlay identity concerns do not apply. Falls back
+    /// to the eager copy whenever a range cannot be mapped safely; the
+    /// snapshot file must remain on disk for the VM lifetime.
     fn mmap_saved_regions(
         &mut self,
         file_path: PathBuf,
@@ -939,7 +936,7 @@ impl MemoryManager {
             .read(true)
             .open(file_path)
             .map_err(Error::SnapshotOpen)?;
-        // A range mapped past EOF faults SIGBUS at run time, not restore time; reject a short/truncated file up front.
+        // A range mapped past EOF faults SIGBUS at run time, not restore time.
         let mapped_len: u64 = saved_regions.regions().iter().map(|r| r.length).sum();
         let file_len = memory_file.metadata().map_err(Error::SnapshotOpen)?.len();
         if file_len < mapped_len {
@@ -3445,11 +3442,9 @@ impl Migratable for MemoryManager {
 }
 
 /// Reports whether every saved range is page-aligned and lies wholly inside a
-/// single plain private-anonymous guest region — the preconditions for a
-/// MAP_FIXED overlay. A file-backed region (shared or hugepage RAM, whether
-/// global or per-zone) is rejected: overlaying it would leave stale
-/// mapping metadata that a later snapshot or a vhost-user/VFIO consumer
-/// resolves against the original fd instead of the mapped snapshot.
+/// single plain private-anonymous guest region — the MAP_FIXED overlay
+/// preconditions. File-backed regions are rejected: their stale mapping
+/// metadata would misdirect a later snapshot or fd consumer.
 fn mmap_restore_compatible(
     guest_memory: &GuestMemoryMmap,
     saved_regions: &MemoryRangeTable,
@@ -3483,9 +3478,8 @@ fn mmap_restore_compatible(
     true
 }
 
-/// Maps each saved range from the snapshot file over its guest RAM window,
-/// re-applying the region's reservation and THP policy; caller must have
-/// validated the ranges with [`mmap_restore_compatible`].
+/// Maps each saved range over its guest RAM window, re-applying reserve and
+/// THP policy; ranges must have passed [`mmap_restore_compatible`].
 fn mmap_saved_ranges(
     guest_memory: &GuestMemoryMmap,
     memory_file: &File,
@@ -3500,9 +3494,8 @@ fn mmap_saved_ranges(
             .get_host_address(GuestAddress(range.gpa))
             .map_err(|e| Error::SnapshotMmap(io::Error::other(e)))?;
         let length = range.length as usize;
-        // SAFETY: the target window is page-aligned, wholly inside a live
-        // GuestRegionMmap private anonymous mapping that no KVM slot, device
-        // or thread consumes yet, so the MAP_FIXED replacement is atomic and
+        // SAFETY: the window is page-aligned, wholly inside a live private
+        // anonymous region nothing consumes yet, so the MAP_FIXED replacement
         // cannot clobber foreign mappings; the fd stays valid for the call.
         let ret = unsafe {
             libc::mmap(
