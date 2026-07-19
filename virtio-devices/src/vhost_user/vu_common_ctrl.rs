@@ -187,8 +187,18 @@ impl VhostUserHandle {
         let acked_features =
             acked_features & self.backend_features & !(1u64 << VIRTIO_F_ACCESS_PLATFORM);
 
+        let required_log_size = dirty_log_size(mem.last_addr().raw_value());
+        let dirty_logging = self
+            .shm_log
+            .as_ref()
+            .is_some_and(|log| log.size() as u64 >= required_log_size);
+        let log_all = if dirty_logging {
+            VhostUserVirtioFeatures::LOG_ALL.bits()
+        } else {
+            0
+        };
         self.vu
-            .set_features(acked_features)
+            .set_features(acked_features | log_all)
             .map_err(Error::VhostUserSetFeatures)?;
 
         // Update internal value after it's been sent to the backend.
@@ -196,6 +206,10 @@ impl VhostUserHandle {
 
         // Let's first provide the memory table to the backend.
         self.update_mem_table(mem)?;
+
+        if dirty_logging {
+            self.send_log_base()?;
+        }
 
         // Send set_vring_num here, since it could tell backends, like SPDK,
         // how many virt queues to be handled, which backend required to know
@@ -296,6 +310,12 @@ impl VhostUserHandle {
             self.queue_indexes.push(*queue_index);
         }
 
+        self.vrings_info = Some(vrings_info);
+
+        if dirty_logging {
+            self.set_vring_logging(true)?;
+        }
+
         self.enable_vhost_user_vrings(self.queue_indexes.clone(), true)?;
 
         if let Some(backend_req_handler) = backend_req_handler {
@@ -304,7 +324,6 @@ impl VhostUserHandle {
                 .map_err(Error::VhostUserSetBackendRequestFd)?;
         }
 
-        self.vrings_info = Some(vrings_info);
         self.ready = true;
 
         Ok(())
@@ -752,9 +771,7 @@ impl VhostUserHandle {
         // A page is always 4kiB from a vhost-user perspective, and each bit is
         // a page. The bitmap is read back as u64 words, so round it up to a
         // whole word to keep the last pages of guest RAM covered.
-        let ram_size_per_u64 = VHOST_LOG_PAGE * u64::from(u64::BITS);
-        let mmap_size = (last_ram_addr / ram_size_per_u64 + 1) * size_of::<u64>() as u64;
-        let mmap_handle = file.as_raw_fd();
+        let mmap_size = dirty_log_size(last_ram_addr);
 
         // Set shm_log region size
         file.set_len(mmap_size).map_err(Error::SetFileSize)?;
@@ -785,17 +802,28 @@ impl VhostUserHandle {
         // released.
         let old_region = self.shm_log.replace(Arc::new(region));
 
+        self.send_log_base()?;
+
+        Ok(old_region)
+    }
+
+    fn send_log_base(&mut self) -> Result<()> {
+        let region = self.shm_log.as_ref().ok_or(Error::MissingShmLogRegion)?;
+        let mmap_handle = region
+            .file_offset()
+            .ok_or(Error::MissingShmLogRegion)?
+            .file()
+            .as_raw_fd();
+
         // Send the shm_log fd over to the backend
         let log = VhostUserDirtyLogRegion {
-            mmap_size,
+            mmap_size: region.size() as u64,
             mmap_offset: 0,
             mmap_handle,
         };
         self.vu
             .set_log_base(0, Some(log))
-            .map_err(Error::VhostUserSetLogBase)?;
-
-        Ok(old_region)
+            .map_err(Error::VhostUserSetLogBase)
     }
 
     fn set_vring_logging(&mut self, enable: bool) -> Result<()> {
@@ -876,6 +904,11 @@ impl VhostUserHandle {
             Err(Error::MissingShmLogRegion)
         }
     }
+}
+
+fn dirty_log_size(last_ram_addr: u64) -> u64 {
+    let ram_size_per_u64 = VHOST_LOG_PAGE * u64::from(u64::BITS);
+    (last_ram_addr / ram_size_per_u64 + 1) * size_of::<u64>() as u64
 }
 
 fn memfd_create(name: &ffi::CStr, flags: u32) -> io::Result<RawFd> {

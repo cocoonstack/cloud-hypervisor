@@ -51,7 +51,8 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
     ApiRequest, ApiResponse, BalloonStatsResponse, MigrationMode, RequestHandler, TimeoutStrategy,
-    VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmSnapshotConfig, VmSnapshotType,
+    VmmPingResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -716,6 +717,12 @@ pub enum GuestResetAction {
     ShutdownVm,
 }
 
+struct SnapshotSeries {
+    destination_url: String,
+    layout: MemoryRangeTable,
+    next_seq: u32,
+}
+
 pub struct Vmm {
     epoll: EpollContext,
     exit_evt: EventFd,
@@ -744,6 +751,8 @@ pub struct Vmm {
     shutdown_action: GuestShutdownAction,
     reset_action: GuestResetAction,
     check_migration_evt: EventFd,
+    // dirty logging is active while a series exists
+    snapshot_series: Option<SnapshotSeries>,
 }
 
 /// Time before aborting on the page fault connection.
@@ -973,6 +982,7 @@ impl Vmm {
             shutdown_action,
             reset_action,
             check_migration_evt,
+            snapshot_series: None,
         })
     }
 
@@ -2591,20 +2601,77 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+    fn vm_snapshot(&mut self, config: &VmSnapshotConfig) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 if vm.restoring() {
                     return Err(VmError::VmRestoring);
                 }
+                let requested_diff = config.snapshot_type == VmSnapshotType::Diff;
+                // the first diff of a series is a full baseline
+                let effective_diff = requested_diff && self.snapshot_series.is_some();
+                if requested_diff {
+                    let layout = vm
+                        .memory_range_table(MemoryRangePolicy::SkipPersisted)
+                        .map_err(VmError::Snapshot)?;
+                    if let Some(series) = &self.snapshot_series {
+                        if config.destination_url != series.destination_url {
+                            return Err(VmError::Snapshot(MigratableError::Snapshot(anyhow!(
+                                "a diff snapshot must target its series directory {}",
+                                series.destination_url
+                            ))));
+                        }
+                        if series.layout.ranges() != layout.ranges() {
+                            self.snapshot_series = None;
+                            let _ = vm.stop_dirty_log();
+                            return Err(VmError::Snapshot(MigratableError::Snapshot(anyhow!(
+                                "memory layout changed since the snapshot series \
+                                 started; take a full snapshot"
+                            ))));
+                        }
+                    } else {
+                        if let Err(e) = vm.start_dirty_log() {
+                            let _ = vm.stop_dirty_log();
+                            return Err(VmError::Snapshot(e));
+                        }
+                        self.snapshot_series = Some(SnapshotSeries {
+                            destination_url: config.destination_url.clone(),
+                            layout,
+                            next_seq: 1,
+                        });
+                    }
+                } else if self.snapshot_series.take().is_some() {
+                    vm.stop_dirty_log().map_err(VmError::Snapshot)?;
+                }
+
+                let diff_seq = self
+                    .snapshot_series
+                    .as_ref()
+                    .filter(|_| effective_diff)
+                    .map(|s| s.next_seq);
+                vm.set_snapshot_diff_count(diff_seq.unwrap_or(0));
                 // Drain console_info so that FDs are not reused
                 let _ = self.console_info.take();
-                vm.snapshot()
+                let result = vm
+                    .snapshot()
                     .map_err(VmError::Snapshot)
                     .and_then(|snapshot| {
-                        vm.send(&snapshot, destination_url)
+                        if diff_seq.is_some() {
+                            // harvest after device capture to include its side-effect writes
+                            let table = vm.dirty_log().map_err(VmError::Snapshot)?;
+                            vm.set_diff_snapshot_ranges(table);
+                        }
+                        vm.send(&snapshot, &config.destination_url)
                             .map_err(VmError::SnapshotSend)
-                    })
+                    });
+                if result.is_err() {
+                    if self.snapshot_series.take().is_some() {
+                        let _ = vm.stop_dirty_log();
+                    }
+                } else if let (Some(_), Some(series)) = (diff_seq, self.snapshot_series.as_mut()) {
+                    series.next_seq += 1;
+                }
+                result
             }
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => Err(VmError::VmNotRunning),
@@ -2721,6 +2788,7 @@ impl RequestHandler for Vmm {
             return Err(VmError::VmNotCreated);
         }
         let mut vm = self.vm.take_owned_or(VmError::VmNotRunning)?;
+        self.snapshot_series = None;
         // Drain console_info so that the FDs are not reused
         let _ = self.console_info.take();
         vm.shutdown();
@@ -2735,6 +2803,7 @@ impl RequestHandler for Vmm {
         // we reboot.
         let config = {
             let mut vm = self.vm.take_owned_or(VmError::VmNotCreated)?;
+            self.snapshot_series = None;
             let config = vm.get_config();
             // First we stop the current VM
             vm.shutdown();
@@ -2863,6 +2932,7 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_delete(&mut self) -> result::Result<(), VmError> {
+        self.snapshot_series = None;
         if self.vm_config.is_none() {
             return Ok(());
         }
@@ -3423,6 +3493,11 @@ impl RequestHandler for Vmm {
         &mut self,
         send_data_migration: VmSendMigrationData,
     ) -> result::Result<(), MigratableError> {
+        if self.snapshot_series.take().is_some()
+            && let VmOwnership::Owned(ref mut vm) = self.vm
+        {
+            let _ = vm.stop_dirty_log();
+        }
         match self.vm {
             VmOwnership::Owned(ref vm) => {
                 if vm.restoring() {
