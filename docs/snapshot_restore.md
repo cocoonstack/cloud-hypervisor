@@ -60,6 +60,38 @@ be needed.
 `state.json` contains the virtual machine state. It is used to restore each
 component in the state it was left before the snapshot occurred.
 
+## Diff snapshots
+
+Passing `snapshot_type=diff` (`ch-remote snapshot --diff <url>`) writes only
+the pages dirtied since the previous snapshot of the series. The first `diff`
+request takes a full baseline and enables dirty-page tracking; each subsequent
+one dumps the delta, so the pause cost is proportional to the amount of dirtied
+memory rather than to the guest RAM size. A `full` request (or any snapshot
+failure, a memory layout change, a migration, or deleting the VM) ends the
+series; the next `diff` starts a new one with a fresh baseline.
+
+The whole series lives in one directory, and every `diff` request of a series
+must target that same directory:
+
+```bash
+ls /foo/snapshot/
+config.json  memory-ranges  memory-ranges.diff.1  memory-ranges.diff.2  state.json
+```
+
+Each `memory-ranges.diff.N` is a sparse file whose extents sit at the same
+offsets as in the baseline `memory-ranges`. `config.json` and `state.json`
+always describe the newest delta. A delta is written under a temporary name
+and renamed into place, so an interrupted diff never invalidates a consistent
+directory. A full dump into a directory removes any leftover delta files.
+
+Restore needs no extra parameter: point `source_url` at the directory. When
+delta files are present, memory fills from the baseline and each delta's dirty
+extents replay in sequence order; a gap in the sequence or a delta whose
+length does not match the layout fails the restore before any page is
+touched. The files must sit on a filesystem with `SEEK_DATA`/`SEEK_HOLE`
+support, and a diff-snapshot series cannot be combined with
+`memory_restore_mode=ondemand`.
+
 ## Restore a Cloud Hypervisor VM
 
 Given that one has access to an existing snapshot in `/home/foo/snapshot`,
