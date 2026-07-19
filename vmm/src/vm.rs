@@ -14,11 +14,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(feature = "fw_cfg")]
 use std::ffi;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::Instant;
@@ -3064,6 +3065,20 @@ impl Vm {
         self.memory_manager.lock().unwrap().memory_range_table(mode)
     }
 
+    pub fn set_snapshot_diff_count(&mut self, count: u32) {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .set_snapshot_diff_count(count);
+    }
+
+    pub fn set_diff_snapshot_ranges(&mut self, table: MemoryRangeTable) {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .set_diff_snapshot_ranges(table);
+    }
+
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
         self.memory_manager.lock().unwrap().guest_memory()
     }
@@ -3398,66 +3413,88 @@ impl Snapshottable for Vm {
     }
 }
 
+// With `replace` the file is synced under a temporary name and the returned
+// rename installs it; otherwise the file must not exist yet.
+fn store_snapshot_file(
+    destination_url: &str,
+    name: &str,
+    bytes: &[u8],
+    replace: bool,
+) -> result::Result<Option<(PathBuf, PathBuf)>, MigratableError> {
+    let mut final_path = url_to_path(destination_url)?;
+    final_path.push(name);
+    let write_path = if replace {
+        let tmp = final_path.with_extension("tmp");
+        let _ = fs::remove_file(&tmp);
+        tmp
+    } else {
+        final_path.clone()
+    };
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&write_path)
+        .with_context(|| format!("Error creating snapshot file {write_path:?}"))
+        .map_err(MigratableError::MigrateSend)?;
+    file.write_all(bytes)
+        .with_context(|| format!("Error writing snapshot file {write_path:?}"))
+        .map_err(MigratableError::MigrateSend)?;
+    if replace {
+        file.sync_all()
+            .with_context(|| format!("Error syncing snapshot file {write_path:?}"))
+            .map_err(MigratableError::MigrateSend)?;
+        return Ok(Some((write_path, final_path)));
+    }
+    Ok(None)
+}
+
 impl Transportable for Vm {
     fn send(
         &self,
         snapshot: &Snapshot,
         destination_url: &str,
     ) -> result::Result<(), MigratableError> {
-        let mut snapshot_config_path = url_to_path(destination_url)?;
-        snapshot_config_path.push(SNAPSHOT_CONFIG_FILE);
+        let replace = self.memory_manager.lock().unwrap().diff_snapshot_active();
+        let send_memory = || match snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
+            Some(memory_manager_snapshot) => self
+                .memory_manager
+                .lock()
+                .unwrap()
+                .send(&memory_manager_snapshot.clone(), destination_url),
+            None => Err(MigratableError::Restore(anyhow!(
+                "Missing memory manager snapshot"
+            ))),
+        };
 
-        // Create the snapshot config file
-        let mut snapshot_config_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(snapshot_config_path)
-            .context("Error creating VM config snapshot file")
-            .map_err(MigratableError::MigrateSend)?;
+        // a diff file lands before the state that counts it
+        if replace {
+            send_memory()?;
+        }
 
-        // Serialize and write the snapshot config
         let vm_config = serde_json::to_string(self.config.lock().unwrap().deref())
             .context("Error serializing VM config snapshot")
             .map_err(MigratableError::MigrateSend)?;
+        let config_rename = store_snapshot_file(
+            destination_url,
+            SNAPSHOT_CONFIG_FILE,
+            vm_config.as_bytes(),
+            replace,
+        )?;
 
-        snapshot_config_file
-            .write_all(vm_config.as_bytes())
-            .context("Error writing VM config snapshot")
-            .map_err(MigratableError::MigrateSend)?;
-
-        let mut snapshot_state_path = url_to_path(destination_url)?;
-        snapshot_state_path.push(SNAPSHOT_STATE_FILE);
-
-        // Create the snapshot state file
-        let mut snapshot_state_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(snapshot_state_path)
-            .context("Error creating VM state snapshot file")
-            .map_err(MigratableError::MigrateSend)?;
-
-        // Serialize and write the snapshot state
         let vm_state = serde_json::to_vec(snapshot)
             .context("Error serializing VM state snapshot")
             .map_err(MigratableError::MigrateSend)?;
+        let state_rename =
+            store_snapshot_file(destination_url, SNAPSHOT_STATE_FILE, &vm_state, replace)?;
+        for (from, to) in config_rename.into_iter().chain(state_rename) {
+            fs::rename(&from, &to)
+                .with_context(|| format!("Error renaming {from:?} to {to:?}"))
+                .map_err(MigratableError::MigrateSend)?;
+        }
 
-        snapshot_state_file
-            .write_all(&vm_state)
-            .context("Error writing VM state snapshot")
-            .map_err(MigratableError::MigrateSend)?;
-
-        // Tell the memory manager to also send/write its own snapshot.
-        if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
-            self.memory_manager
-                .lock()
-                .unwrap()
-                .send(&memory_manager_snapshot.clone(), destination_url)?;
-        } else {
-            return Err(MigratableError::Restore(anyhow!(
-                "Missing memory manager snapshot"
-            )));
+        if !replace {
+            send_memory()?;
         }
 
         Ok(())
