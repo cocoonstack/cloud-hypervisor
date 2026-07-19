@@ -6,7 +6,7 @@
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::mem::{MaybeUninit, zeroed};
 use std::num::NonZeroUsize;
@@ -226,6 +226,9 @@ pub struct MemoryManager {
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    // When set, Transportable::send writes only these dirty ranges, placed at
+    // their offsets within the full snapshot layout (diff snapshot).
+    diff_snapshot_ranges: Option<(MemoryRangeTable, u32)>,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -390,6 +393,18 @@ pub enum Error {
     /// Error reading from snapshot file
     #[error("Error reading from snapshot file")]
     SnapshotRead(#[source] io::Error),
+
+    /// Error scanning the snapshot directory for diff files
+    #[error("Error scanning the snapshot directory for diff files")]
+    RestoreDiffScan(#[source] io::Error),
+
+    /// The diff-file sequence has a gap
+    #[error("Diff snapshot {0} is missing from the snapshot directory")]
+    RestoreDiffGap(u32),
+
+    /// A diff-snapshot series cannot be restored on demand
+    #[error("A diff-snapshot series cannot be combined with 'memory_restore_mode=ondemand'")]
+    RestoreDiffWithOnDemand,
 
     // Error copying snapshot into region
     #[error("Error copying snapshot into region")]
@@ -847,82 +862,15 @@ impl MemoryManager {
         file_path: PathBuf,
         saved_regions: &MemoryRangeTable,
     ) -> Result<(), Error> {
-        if saved_regions.is_empty() {
-            return Ok(());
-        }
+        replay_memory_file(&self.guest_memory.memory(), file_path, saved_regions, true)
+    }
 
-        // Open (read only) the snapshot file.
-        let mut memory_file = OpenOptions::new()
-            .read(true)
-            .open(file_path)
-            .map_err(Error::SnapshotOpen)?;
-
-        let guest_memory = self.guest_memory.memory();
-        let mut file_cursor: u64 = 0;
-
-        for range in saved_regions.regions() {
-            let end = file_cursor + range.length;
-
-            // First call doubles as a SEEK_HOLE-support probe. On error,
-            // take the dense path which seeks-and-streams sequentially.
-            match next_data_extent(memory_file.as_fd(), file_cursor, end) {
-                Ok(mut next) => {
-                    while let Some((data_off, ext_len)) = next {
-                        debug_assert!(data_off >= file_cursor);
-                        let in_region = data_off
-                            .checked_sub(file_cursor)
-                            .expect("extent precedes file_cursor");
-                        memory_file
-                            .seek(SeekFrom::Start(data_off))
-                            .map_err(Error::SnapshotRead)?;
-                        let mut done: u64 = 0;
-                        while done < ext_len {
-                            let n = guest_memory
-                                .read_volatile_from(
-                                    GuestAddress(range.gpa + in_region + done),
-                                    &mut memory_file,
-                                    (ext_len - done) as usize,
-                                )
-                                .map_err(Error::SnapshotCopy)?;
-                            if n == 0 {
-                                return Err(Error::SnapshotRead(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "read_volatile_from returned 0 inside data extent",
-                                )));
-                            }
-                            done += n as u64;
-                        }
-                        next = next_data_extent(memory_file.as_fd(), data_off + ext_len, end)
-                            .map_err(Error::SnapshotRead)?;
-                    }
-                }
-                Err(_) => {
-                    memory_file
-                        .seek(SeekFrom::Start(file_cursor))
-                        .map_err(Error::SnapshotRead)?;
-                    let mut offset: u64 = 0;
-                    // Manual partial-read loop preserves the workaround for
-                    // https://github.com/rust-vmm/vm-memory/issues/174
-                    loop {
-                        let bytes_read = guest_memory
-                            .read_volatile_from(
-                                GuestAddress(range.gpa + offset),
-                                &mut memory_file,
-                                (range.length - offset) as usize,
-                            )
-                            .map_err(Error::SnapshotCopy)?;
-                        offset += bytes_read as u64;
-                        if offset == range.length {
-                            break;
-                        }
-                    }
-                }
-            }
-
-            file_cursor = end;
-        }
-
-        Ok(())
+    fn apply_diff_snapshot(
+        &mut self,
+        file_path: PathBuf,
+        saved_regions: &MemoryRangeTable,
+    ) -> Result<(), Error> {
+        apply_diff_file(&self.guest_memory.memory(), file_path, saved_regions)
     }
 
     /// Restore guest memory by mapping the snapshot file copy-on-write over
@@ -1935,6 +1883,7 @@ impl MemoryManager {
             reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            diff_snapshot_ranges: None,
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
@@ -1980,20 +1929,44 @@ impl MemoryManager {
                 Default::default(),
             )?;
 
-            match memory_restore_mode {
-                MemoryRestoreMode::OnDemand => mm.lock().unwrap().restore_by_uffd(
-                    &memory_file_path,
-                    &mem_snapshot.memory_ranges,
-                    exit_evt,
-                )?,
-                MemoryRestoreMode::CopyOnWrite => mm
-                    .lock()
-                    .unwrap()
-                    .mmap_cow_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
-                MemoryRestoreMode::Copy => mm
-                    .lock()
-                    .unwrap()
-                    .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
+            let source_dir = url_to_path(source_url).map_err(Error::Restore)?;
+            let deltas = discover_diff_files(&source_dir)?;
+            if deltas.is_empty() {
+                match memory_restore_mode {
+                    MemoryRestoreMode::OnDemand => mm.lock().unwrap().restore_by_uffd(
+                        &memory_file_path,
+                        &mem_snapshot.memory_ranges,
+                        exit_evt,
+                    )?,
+                    MemoryRestoreMode::CopyOnWrite => mm
+                        .lock()
+                        .unwrap()
+                        .mmap_cow_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
+                    MemoryRestoreMode::Copy => mm
+                        .lock()
+                        .unwrap()
+                        .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
+                }
+            } else {
+                // Diff-snapshot series: fill from the baseline (honoring the
+                // restore mode), then replay each delta's dirty extents in
+                // sequence order. Replayed writes over a copy-on-write
+                // baseline fault in privately, so the sharing story is
+                // unchanged.
+                if memory_restore_mode == MemoryRestoreMode::OnDemand {
+                    return Err(Error::RestoreDiffWithOnDemand);
+                }
+                let mut mm_locked = mm.lock().unwrap();
+                if memory_restore_mode == MemoryRestoreMode::CopyOnWrite {
+                    mm_locked
+                        .mmap_cow_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+                } else {
+                    mm_locked.fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?;
+                }
+                for delta in deltas {
+                    mm_locked.apply_diff_snapshot(delta, &mem_snapshot.memory_ranges)?;
+                }
+                drop(mm_locked);
             }
 
             Ok(mm)
@@ -3308,12 +3281,29 @@ pub struct MemoryManagerSnapshotData {
     next_hotplug_slot: usize,
 }
 
+impl MemoryManager {
+    /// Restricts the next Transportable::send to the given dirty ranges,
+    /// written at their offsets within the full snapshot layout as delta
+    /// number `seq` of the series.
+    pub fn set_diff_snapshot_ranges(&mut self, table: MemoryRangeTable, seq: u32) {
+        self.diff_snapshot_ranges = Some((table, seq));
+    }
+
+    /// Whether the next Transportable::send writes a delta of a series.
+    pub fn diff_snapshot_active(&self) -> bool {
+        self.diff_snapshot_ranges.is_some()
+    }
+}
+
 impl Snapshottable for MemoryManager {
     fn id(&self) -> String {
         MEMORY_MANAGER_SNAPSHOT_ID.to_string()
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        // A stale diff table must not leak into this snapshot; the caller
+        // re-injects one after device capture when a diff is requested.
+        self.diff_snapshot_ranges = None;
         let memory_ranges = self.memory_range_table(MemoryRangePolicy::SkipPersisted)?;
 
         // Store locally this list of ranges as it will be used through the
@@ -3342,8 +3332,29 @@ impl Transportable for MemoryManager {
             return Ok(());
         }
 
-        let mut memory_file_path = url_to_path(destination_url)?;
-        memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+        let dest_dir = url_to_path(destination_url)?;
+        // A delta only carries dirty extents; its sequence number is its
+        // replay position within the series directory.
+        let diff_seq = self.diff_snapshot_ranges.as_ref().map(|(_, seq)| *seq);
+        let final_path = match diff_seq {
+            Some(seq) => dest_dir.join(format!("{SNAPSHOT_FILENAME}.diff.{seq}")),
+            None => dest_dir.join(SNAPSHOT_FILENAME),
+        };
+        // A delta is written under a temporary name and renamed into place,
+        // so an interrupted diff never invalidates a consistent directory. A
+        // full dump instead removes any leftover deltas: restore discovers
+        // diff files automatically, and stale ones would replay over the new
+        // baseline.
+        let memory_file_path = if let Some(seq) = diff_seq {
+            let tmp = dest_dir.join(format!("{SNAPSHOT_FILENAME}.diff.{seq}.tmp"));
+            let _ = fs::remove_file(&tmp);
+            tmp
+        } else {
+            remove_diff_files(&dest_dir)
+                .context("Error removing stale diff files")
+                .map_err(MigratableError::MigrateSend)?;
+            final_path.clone()
+        };
 
         let mut memory_file = OpenOptions::new()
             .read(true)
@@ -3369,10 +3380,44 @@ impl Transportable for MemoryManager {
         // write path which never writes past the growing EOF.
         let sparse_layout = memory_file.set_len(total_len).is_ok();
 
-        let guest_memory = self.guest_memory.memory();
-        let mut file_cursor: u64 = 0;
+        // (file offset, range) pairs: a full snapshot lays ranges out densely;
+        // a diff places each dirty range at its offset within that same layout
+        // so its extents apply onto a base snapshot without translation.
+        let mut write_plan: Vec<(u64, MemoryRange)> = Vec::new();
+        let mut layout_cursor: u64 = 0;
+        for full in self.snapshot_memory_ranges.regions() {
+            match &self.diff_snapshot_ranges {
+                None => write_plan.push((
+                    layout_cursor,
+                    MemoryRange {
+                        gpa: full.gpa,
+                        length: full.length,
+                    },
+                )),
+                Some((dirty, _)) => {
+                    for d in dirty.regions() {
+                        let start = d.gpa.max(full.gpa);
+                        let end = (d.gpa + d.length).min(full.gpa + full.length);
+                        if start < end {
+                            write_plan.push((
+                                layout_cursor + (start - full.gpa),
+                                MemoryRange {
+                                    gpa: start,
+                                    length: end - start,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            layout_cursor += full.length;
+        }
+        debug_assert_eq!(layout_cursor, total_len);
 
-        for range in self.snapshot_memory_ranges.regions() {
+        let guest_memory = self.guest_memory.memory();
+
+        for (file_cursor, range) in write_plan {
+            let range = &range;
             let mut wrote_sparse = false;
             if sparse_layout
                 && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
@@ -3423,11 +3468,18 @@ impl Transportable for MemoryManager {
                     }
                 }
             }
-
-            file_cursor += range.length;
         }
 
-        debug_assert_eq!(file_cursor, total_len);
+        if memory_file_path != final_path {
+            memory_file
+                .sync_all()
+                .context("Error syncing memory snapshot delta")
+                .map_err(MigratableError::MigrateSend)?;
+            fs::rename(&memory_file_path, &final_path)
+                .with_context(|| format!("Error renaming {memory_file_path:?} to {final_path:?}"))
+                .map_err(MigratableError::MigrateSend)?;
+        }
+
         Ok(())
     }
 }
@@ -3597,6 +3649,166 @@ fn do_mmap_cow_saved_regions(
             Error::SnapshotMmap(io::Error::other("snapshot range file offset overflow"))
         })?;
     }
+
+    Ok(())
+}
+
+/// Reads a snapshot memory file into guest RAM, walking the file's data
+/// extents and skipping holes. When the filesystem cannot report extents,
+/// `dense_fallback` selects between streaming the whole layout (full
+/// snapshot) and failing (diff snapshot, where a hole must keep the content
+/// the pages already have).
+fn replay_memory_file(
+    guest_memory: &GuestMemoryMmap,
+    file_path: PathBuf,
+    saved_regions: &MemoryRangeTable,
+    dense_fallback: bool,
+) -> Result<(), Error> {
+    if saved_regions.is_empty() {
+        return Ok(());
+    }
+
+    // Open (read only) the snapshot file.
+    let mut memory_file = OpenOptions::new()
+        .read(true)
+        .open(file_path)
+        .map_err(Error::SnapshotOpen)?;
+
+    let mut file_cursor: u64 = 0;
+
+    for range in saved_regions.regions() {
+        let end = file_cursor + range.length;
+
+        // First call doubles as a SEEK_HOLE-support probe. On error,
+        // take the dense path which seeks-and-streams sequentially.
+        match next_data_extent(memory_file.as_fd(), file_cursor, end) {
+            Ok(mut next) => {
+                while let Some((data_off, ext_len)) = next {
+                    debug_assert!(data_off >= file_cursor);
+                    let in_region = data_off
+                        .checked_sub(file_cursor)
+                        .expect("extent precedes file_cursor");
+                    memory_file
+                        .seek(SeekFrom::Start(data_off))
+                        .map_err(Error::SnapshotRead)?;
+                    let mut done: u64 = 0;
+                    while done < ext_len {
+                        let n = guest_memory
+                            .read_volatile_from(
+                                GuestAddress(range.gpa + in_region + done),
+                                &mut memory_file,
+                                (ext_len - done) as usize,
+                            )
+                            .map_err(Error::SnapshotCopy)?;
+                        if n == 0 {
+                            return Err(Error::SnapshotRead(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "read_volatile_from returned 0 inside data extent",
+                            )));
+                        }
+                        done += n as u64;
+                    }
+                    next = next_data_extent(memory_file.as_fd(), data_off + ext_len, end)
+                        .map_err(Error::SnapshotRead)?;
+                }
+            }
+            Err(e) if !dense_fallback => {
+                return Err(Error::SnapshotRead(io::Error::new(
+                    e.kind(),
+                    format!("diff restore needs SEEK_DATA/SEEK_HOLE support: {e}"),
+                )));
+            }
+            Err(_) => {
+                memory_file
+                    .seek(SeekFrom::Start(file_cursor))
+                    .map_err(Error::SnapshotRead)?;
+                let mut offset: u64 = 0;
+                // Manual partial-read loop preserves the workaround for
+                // https://github.com/rust-vmm/vm-memory/issues/174
+                loop {
+                    let bytes_read = guest_memory
+                        .read_volatile_from(
+                            GuestAddress(range.gpa + offset),
+                            &mut memory_file,
+                            (range.length - offset) as usize,
+                        )
+                        .map_err(Error::SnapshotCopy)?;
+                    offset += bytes_read as u64;
+                    if offset == range.length {
+                        break;
+                    }
+                }
+            }
+        }
+
+        file_cursor = end;
+    }
+
+    Ok(())
+}
+
+/// Applies a diff snapshot's dirty extents over already-restored RAM; the
+/// hole-punched pages the delta never dirtied keep their baseline content.
+/// The length check rejects a file that is not from the restored series'
+/// layout before any page is touched.
+fn apply_diff_file(
+    guest_memory: &GuestMemoryMmap,
+    file_path: PathBuf,
+    saved_regions: &MemoryRangeTable,
+) -> Result<(), Error> {
+    let total_len: u64 = saved_regions.regions().iter().map(|r| r.length).sum();
+    let file_len = fs::metadata(&file_path).map_err(Error::SnapshotOpen)?.len();
+    if file_len != total_len {
+        return Err(Error::SnapshotOpen(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "diff file {} is {file_len} bytes, expected {total_len}: \
+                 not from this snapshot series?",
+                file_path.display()
+            ),
+        )));
+    }
+    replay_memory_file(guest_memory, file_path, saved_regions, false)
+}
+
+/// Finds the deltas of a diff-snapshot series in `dir`, in replay order.
+/// Sequence numbers must be contiguous from 1; a gap fails the restore
+/// before any page is touched. A name whose suffix is not a number (for
+/// example a `.tmp` leftover from an interrupted diff) is ignored.
+fn discover_diff_files(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let prefix = format!("{SNAPSHOT_FILENAME}.diff.");
+    let mut deltas: Vec<(u32, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(dir).map_err(Error::RestoreDiffScan)? {
+        let entry = entry.map_err(Error::RestoreDiffScan)?;
+        if let Some(name) = entry.file_name().to_str()
+            && let Some(rest) = name.strip_prefix(&prefix)
+            && let Ok(seq) = rest.parse::<u32>()
+        {
+            deltas.push((seq, entry.path()));
+        }
+    }
+    deltas.sort_unstable_by_key(|(seq, _)| *seq);
+    for (i, (seq, _)) in deltas.iter().enumerate() {
+        if *seq != i as u32 + 1 {
+            return Err(Error::RestoreDiffGap(i as u32 + 1));
+        }
+    }
+    Ok(deltas.into_iter().map(|(_, path)| path).collect())
+}
+
+/// Removes every delta file in `dir`, `.tmp` leftovers included. A full
+/// dump must not leave stale deltas behind: restore discovers diff files
+/// automatically and would replay them over the new baseline.
+fn remove_diff_files(dir: &Path) -> io::Result<()> {
+    let prefix = format!("{SNAPSHOT_FILENAME}.diff.");
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str()
+            && name.strip_prefix(&prefix).is_some()
+        {
+            fs::remove_file(entry.path())?;
+        }
+    }
     Ok(())
 }
 
@@ -3717,5 +3929,99 @@ mod tests {
             do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
             assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
         }
+    }
+
+    fn two_page_table(page: u64) -> MemoryRangeTable {
+        let mut table = MemoryRangeTable::default();
+        table.push(MemoryRange {
+            gpa: 0,
+            length: 2 * page,
+        });
+        table
+    }
+
+    fn temp_file_path(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        dir.path().join(name)
+    }
+
+    #[test]
+    fn diff_replay_overwrites_extents_and_keeps_holes() {
+        let page = page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (2 * page) as usize)]).unwrap();
+        let table = two_page_table(page);
+        let dir = tempfile::tempdir().unwrap();
+
+        // Full baseline: both pages 0x11.
+        let base_path = temp_file_path(&dir, "memory-ranges");
+        let mut base = File::create(&base_path).unwrap();
+        base.write_all(&vec![0x11u8; (2 * page) as usize]).unwrap();
+        replay_memory_file(&gm, base_path, &table, true).unwrap();
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x11);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0x11);
+
+        // Sparse delta: only page 1 dirtied, written as 0xab.
+        let diff_path = temp_file_path(&dir, "memory-ranges.diff");
+        let mut diff = File::create(&diff_path).unwrap();
+        diff.set_len(2 * page).unwrap();
+        diff.seek(SeekFrom::Start(page)).unwrap();
+        diff.write_all(&vec![0xabu8; page as usize]).unwrap();
+        apply_diff_file(&gm, diff_path, &table).unwrap();
+
+        // Page 0 sits in the delta's hole and must keep the baseline content.
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x11);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page - 1)).unwrap(), 0x11);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(page)).unwrap(), 0xab);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(2 * page - 1)).unwrap(), 0xab);
+    }
+
+    #[test]
+    fn diff_replay_rejects_wrong_length_file() {
+        let page = page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (2 * page) as usize)]).unwrap();
+        let table = two_page_table(page);
+        let dir = tempfile::tempdir().unwrap();
+
+        // A file one page short cannot be a delta of this layout.
+        let diff_path = temp_file_path(&dir, "memory-ranges.diff.1");
+        File::create(&diff_path).unwrap().set_len(page).unwrap();
+        apply_diff_file(&gm, diff_path, &table).unwrap_err();
+    }
+
+    #[test]
+    fn diff_discovery_orders_ignores_and_detects_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "memory-ranges",
+            "memory-ranges.diff.2",
+            "memory-ranges.diff.1",
+            "memory-ranges.diff.10",
+            "config.json",
+        ] {
+            File::create(dir.path().join(name)).unwrap();
+        }
+        // A gap (3..=9 missing) fails before any page is touched.
+        assert!(matches!(
+            discover_diff_files(dir.path()),
+            Err(Error::RestoreDiffGap(3))
+        ));
+
+        fs::remove_file(dir.path().join("memory-ranges.diff.10")).unwrap();
+        // A .tmp leftover from an interrupted diff is ignored.
+        File::create(dir.path().join("memory-ranges.diff.3.tmp")).unwrap();
+        let deltas = discover_diff_files(dir.path()).unwrap();
+        assert_eq!(
+            deltas,
+            vec![
+                dir.path().join("memory-ranges.diff.1"),
+                dir.path().join("memory-ranges.diff.2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_discovery_empty_without_deltas() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("memory-ranges")).unwrap();
+        assert!(discover_diff_files(dir.path()).unwrap().is_empty());
     }
 }
