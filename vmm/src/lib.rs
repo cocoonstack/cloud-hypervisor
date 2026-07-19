@@ -49,7 +49,8 @@ use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
     ApiRequest, ApiResponse, BalloonStatsResponse, MigrationMode, RequestHandler, TimeoutStrategy,
-    VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmSnapshotConfig, VmSnapshotType,
+    VmmPingResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -694,6 +695,14 @@ impl VmOwnership {
     }
 }
 
+// An active diff-snapshot series: every delta lands in the directory the
+// baseline was written to, numbered by `next_seq`.
+struct SnapshotSeries {
+    destination_url: String,
+    layout: MemoryRangeTable,
+    next_seq: u32,
+}
+
 pub struct Vmm {
     epoll: EpollContext,
     exit_evt: EventFd,
@@ -718,10 +727,22 @@ pub struct Vmm {
     serial_socket_listener: Option<Arc<LockedUnixListener>>,
     no_shutdown: bool,
     check_migration_evt: EventFd,
+    // Memory layout at diff-snapshot series start; Some = dirty logging active.
+    snapshot_series: Option<SnapshotSeries>,
 }
 
 /// Time before aborting on the page fault connection.
 const FAULT_CONNECTION_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether two snapshot memory layouts describe the same regions, i.e. a diff
+/// written against one applies at the same file offsets as the other.
+fn same_memory_layout(a: &MemoryRangeTable, b: &MemoryRangeTable) -> bool {
+    a.regions().len() == b.regions().len()
+        && a.regions()
+            .iter()
+            .zip(b.regions())
+            .all(|(x, y)| x.gpa == y.gpa && x.length == y.length)
+}
 
 /// Just a wrapper for the data that goes into
 /// [`ReceiveMigrationState::Configured`]
@@ -951,6 +972,7 @@ impl Vmm {
             serial_socket_listener: None,
             no_shutdown,
             check_migration_evt,
+            snapshot_series: None,
         })
     }
 
@@ -2464,20 +2486,84 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+    fn vm_snapshot(&mut self, config: &VmSnapshotConfig) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 if vm.restoring() {
                     return Err(VmError::VmRestoring);
                 }
+                let requested_diff = config.snapshot_type == VmSnapshotType::Diff;
+                // A diff request continues the series if one is active;
+                // otherwise it takes a full baseline into the series
+                // directory and starts dirty logging. A full request ends
+                // any active series.
+                let effective_diff = requested_diff && self.snapshot_series.is_some();
+                if requested_diff {
+                    let layout = vm
+                        .memory_range_table(MemoryRangePolicy::SkipPersisted)
+                        .map_err(VmError::Snapshot)?;
+                    if let Some(series) = &self.snapshot_series {
+                        // The whole series lives in one directory; a delta
+                        // elsewhere could never be discovered at restore.
+                        if config.destination_url != series.destination_url {
+                            return Err(VmError::Snapshot(MigratableError::Snapshot(anyhow!(
+                                "a diff snapshot must target its series directory {}",
+                                series.destination_url
+                            ))));
+                        }
+                        if !same_memory_layout(&series.layout, &layout) {
+                            // Offsets in the base file no longer match; a
+                            // delta would rebase corruptly. End the series.
+                            self.snapshot_series = None;
+                            let _ = vm.stop_dirty_log();
+                            return Err(VmError::Snapshot(MigratableError::Snapshot(anyhow!(
+                                "memory layout changed since the snapshot series \
+                                 started; take a full snapshot"
+                            ))));
+                        }
+                    } else {
+                        vm.start_dirty_log().map_err(VmError::Snapshot)?;
+                        self.snapshot_series = Some(SnapshotSeries {
+                            destination_url: config.destination_url.clone(),
+                            layout,
+                            next_seq: 1,
+                        });
+                    }
+                } else if self.snapshot_series.take().is_some() {
+                    vm.stop_dirty_log().map_err(VmError::Snapshot)?;
+                }
+
+                let diff_seq = self.snapshot_series.as_ref().map(|s| s.next_seq);
                 // Drain console_info so that FDs are not reused
                 let _ = self.console_info.take();
-                vm.snapshot()
+                let result = vm
+                    .snapshot()
                     .map_err(VmError::Snapshot)
                     .and_then(|snapshot| {
-                        vm.send(&snapshot, destination_url)
+                        if effective_diff {
+                            // Harvest after device capture so pages dirtied by
+                            // snapshot side effects land in this delta.
+                            let table = vm.dirty_log().map_err(VmError::Snapshot)?;
+                            vm.set_diff_snapshot_ranges(table, diff_seq.unwrap());
+                        }
+                        vm.send(&snapshot, &config.destination_url)
                             .map_err(VmError::SnapshotSend)
-                    })
+                    });
+                match (&result, &mut self.snapshot_series) {
+                    (Ok(()), Some(series)) => {
+                        if effective_diff {
+                            series.next_seq += 1;
+                        }
+                    }
+                    (Err(_), series @ Some(_)) => {
+                        // The harvested bitmap (or the baseline dump) is
+                        // incomplete; the next snapshot must be a full one.
+                        *series = None;
+                        let _ = vm.stop_dirty_log();
+                    }
+                    _ => {}
+                }
+                result
             }
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => Err(VmError::VmNotRunning),
@@ -2485,6 +2571,7 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
+        self.snapshot_series = None;
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
@@ -2746,6 +2833,8 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_delete(&mut self) -> result::Result<(), VmError> {
+        // Any diff-snapshot series dies with the VM.
+        self.snapshot_series = None;
         if self.vm_config.is_none() {
             return Ok(());
         }
@@ -3291,6 +3380,8 @@ impl RequestHandler for Vmm {
         &mut self,
         send_data_migration: VmSendMigrationData,
     ) -> result::Result<(), MigratableError> {
+        // Migration owns the dirty log; any diff-snapshot series ends here.
+        self.snapshot_series = None;
         match self.vm {
             VmOwnership::Owned(ref vm) => {
                 if vm.restoring() {
