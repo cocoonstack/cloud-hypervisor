@@ -6,8 +6,8 @@
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::{MaybeUninit, zeroed};
 use std::num::NonZeroUsize;
 use std::ops::{BitAnd, Not, Sub};
@@ -77,6 +77,9 @@ pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 const DEFAULT_MEMORY_ZONE: &str = "mem0";
 
 const SNAPSHOT_FILENAME: &str = "memory-ranges";
+// a diff file holds this magic, a u64 entry count, (gpa, length) u64 pairs,
+// then each entry's bytes in table order
+const DIFF_SNAPSHOT_MAGIC: [u8; 8] = *b"CHDIFF01";
 
 #[cfg(target_arch = "x86_64")]
 const X86_64_IRQ_BASE: u32 = 5;
@@ -261,6 +264,8 @@ pub struct MemoryManager {
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    diff_snapshot_ranges: Option<MemoryRangeTable>,
+    diff_count: u32,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -425,6 +430,14 @@ pub enum Error {
     /// Error reading from snapshot file
     #[error("Error reading from snapshot file")]
     SnapshotRead(#[source] io::Error),
+
+    /// A diff-snapshot series cannot be restored on demand
+    #[error("A diff-snapshot series cannot be combined with 'memory_restore_mode=ondemand'")]
+    RestoreDiffWithOnDemand,
+
+    /// A diff snapshot file does not describe this snapshot's memory
+    #[error("Invalid diff snapshot {0:?}: {1}")]
+    RestoreDiffInvalid(PathBuf, &'static str),
 
     // Error copying snapshot into region
     #[error("Error copying snapshot into region")]
@@ -2163,6 +2176,8 @@ impl MemoryManager {
             reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            diff_snapshot_ranges: None,
+            diff_count: 0,
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
@@ -2209,6 +2224,10 @@ impl MemoryManager {
             )?;
 
             if !mem_snapshot.memory_ranges.is_empty() {
+                if mem_snapshot.diff_count > 0 && memory_restore_mode == MemoryRestoreMode::OnDemand
+                {
+                    return Err(Error::RestoreDiffWithOnDemand);
+                }
                 match memory_restore_mode {
                     MemoryRestoreMode::OnDemand => mm.lock().unwrap().restore_by_uffd(
                         &memory_file_path,
@@ -2223,6 +2242,17 @@ impl MemoryManager {
                         .lock()
                         .unwrap()
                         .fill_saved_regions(memory_file_path, &mem_snapshot.memory_ranges)?,
+                }
+                if mem_snapshot.diff_count > 0 {
+                    let source_dir = url_to_path(source_url).map_err(Error::Restore)?;
+                    let guest_memory = mm.lock().unwrap().guest_memory.memory();
+                    for seq in 1..=mem_snapshot.diff_count {
+                        apply_diff_file(
+                            &guest_memory,
+                            &diff_file_path(&source_dir, seq),
+                            &mem_snapshot.memory_ranges,
+                        )?;
+                    }
                 }
             }
 
@@ -3055,9 +3085,24 @@ impl MemoryManager {
         Some(ranges)
     }
 
+    /// Sets how many diff files the next snapshot's state replays.
+    pub fn set_snapshot_diff_count(&mut self, count: u32) {
+        self.diff_count = count;
+    }
+
+    /// Makes the next send write diff file number `diff_count` holding these ranges.
+    pub fn set_diff_snapshot_ranges(&mut self, table: MemoryRangeTable) {
+        self.diff_snapshot_ranges = Some(table);
+    }
+
+    pub fn diff_snapshot_active(&self) -> bool {
+        self.diff_snapshot_ranges.is_some()
+    }
+
     pub fn snapshot_data(&self) -> MemoryManagerSnapshotData {
         MemoryManagerSnapshotData {
             memory_ranges: self.snapshot_memory_ranges.clone(),
+            diff_count: self.diff_count,
             guest_ram_mappings: self.guest_ram_mappings.clone(),
             start_of_device_area: self.start_of_device_area.0,
             boot_ram: self.boot_ram,
@@ -3552,6 +3597,8 @@ impl Drop for MemoryManager {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct MemoryManagerSnapshotData {
     memory_ranges: MemoryRangeTable,
+    #[serde(default)]
+    diff_count: u32,
     guest_ram_mappings: Vec<GuestRamMapping>,
     start_of_device_area: u64,
     boot_ram: u64,
@@ -3569,6 +3616,7 @@ impl Snapshottable for MemoryManager {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        self.diff_snapshot_ranges = None;
         let memory_ranges = self.memory_range_table(MemoryRangePolicy::SkipPersisted)?;
 
         // Store locally this list of ranges as it will be used through the
@@ -3595,6 +3643,16 @@ impl Transportable for MemoryManager {
     ) -> result::Result<(), MigratableError> {
         if self.snapshot_memory_ranges.is_empty() {
             return Ok(());
+        }
+
+        if let Some(dirty) = &self.diff_snapshot_ranges {
+            return write_diff_file(
+                &self.guest_memory.memory(),
+                &url_to_path(destination_url)?,
+                self.diff_count,
+                &self.snapshot_memory_ranges,
+                dirty,
+            );
         }
 
         let mut memory_file_path = url_to_path(destination_url)?;
@@ -3757,6 +3815,137 @@ impl Migratable for MemoryManager {
         }
         Ok(table)
     }
+}
+
+fn diff_file_path(dir: &Path, seq: u32) -> PathBuf {
+    dir.join(format!("{SNAPSHOT_FILENAME}.diff.{seq}"))
+}
+
+// Writes the dirty part of `layout` as diff file `seq`, through a temporary
+// name so a failed write leaves no partial file under the final name.
+fn write_diff_file(
+    guest_memory: &GuestMemoryMmap,
+    dir: &Path,
+    seq: u32,
+    layout: &MemoryRangeTable,
+    dirty: &MemoryRangeTable,
+) -> result::Result<(), MigratableError> {
+    let mut entries = Vec::new();
+    for full in layout.ranges() {
+        for d in dirty.ranges() {
+            let start = d.gpa.max(full.gpa);
+            let end = (d.gpa + d.length).min(full.gpa + full.length);
+            if start < end {
+                entries.push(MemoryRange {
+                    gpa: start,
+                    length: end - start,
+                });
+            }
+        }
+    }
+    let mut header = Vec::with_capacity(16 + 16 * entries.len());
+    header.extend_from_slice(&DIFF_SNAPSHOT_MAGIC);
+    header.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for e in &entries {
+        header.extend_from_slice(&e.gpa.to_le_bytes());
+        header.extend_from_slice(&e.length.to_le_bytes());
+    }
+
+    let final_path = diff_file_path(dir, seq);
+    let tmp_path = dir.join(format!("{SNAPSHOT_FILENAME}.diff.{seq}.tmp"));
+    let _ = fs::remove_file(&tmp_path);
+    let send_err = |e: io::Error, what: &str| {
+        MigratableError::MigrateSend(anyhow!("Error {what} diff snapshot {tmp_path:?}: {e}"))
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .map_err(|e| send_err(e, "creating"))?;
+    file.write_all(&header)
+        .map_err(|e| send_err(e, "writing"))?;
+    for e in &entries {
+        let mut offset = 0;
+        // Manual partial-write loop preserves the workaround for
+        // https://github.com/rust-vmm/vm-memory/issues/174
+        while offset < e.length {
+            offset += guest_memory
+                .write_volatile_to(
+                    GuestAddress(e.gpa + offset),
+                    &mut file,
+                    (e.length - offset) as usize,
+                )
+                .context("Error writing diff snapshot memory")
+                .map_err(MigratableError::MigrateSend)? as u64;
+        }
+    }
+    file.sync_all().map_err(|e| send_err(e, "syncing"))?;
+    fs::rename(&tmp_path, &final_path).map_err(|e| send_err(e, "renaming"))?;
+    Ok(())
+}
+
+// Replays a diff file over restored RAM after checking that every entry lies
+// inside `layout` and that the file holds exactly the bytes its table names.
+fn apply_diff_file(
+    guest_memory: &GuestMemoryMmap,
+    path: &Path,
+    layout: &MemoryRangeTable,
+) -> Result<(), Error> {
+    let invalid = |why| Error::RestoreDiffInvalid(path.to_path_buf(), why);
+    let mut file = File::open(path).map_err(Error::SnapshotOpen)?;
+    let file_len = file.metadata().map_err(Error::SnapshotOpen)?.len();
+    let mut head = [[0u8; 8]; 2];
+    file.read_exact(head.as_flattened_mut())
+        .map_err(|_| invalid("truncated header"))?;
+    if head[0] != DIFF_SNAPSHOT_MAGIC {
+        return Err(invalid("bad magic"));
+    }
+    let count = u64::from_le_bytes(head[1]);
+    let table_len = count
+        .checked_mul(16)
+        .and_then(|n| n.checked_add(16))
+        .filter(|&n| n <= file_len)
+        .ok_or_else(|| invalid("entry table exceeds the file"))?;
+    let mut table = vec![0u8; (table_len - 16) as usize];
+    file.read_exact(&mut table).map_err(Error::SnapshotRead)?;
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut data_len: u64 = 0;
+    for &[gpa, length] in table.as_chunks::<8>().0.as_chunks::<2>().0 {
+        let (gpa, length) = (u64::from_le_bytes(gpa), u64::from_le_bytes(length));
+        let inside = gpa.checked_add(length).is_some_and(|end| {
+            layout
+                .ranges()
+                .iter()
+                .any(|r| gpa >= r.gpa && end <= r.gpa + r.length)
+        });
+        if length == 0 || !inside {
+            return Err(invalid("entry outside the snapshot memory layout"));
+        }
+        data_len += length;
+        entries.push(MemoryRange { gpa, length });
+    }
+    if table_len + data_len != file_len {
+        return Err(invalid("data size does not match the entry table"));
+    }
+    for e in entries {
+        let mut offset = 0;
+        while offset < e.length {
+            let n = guest_memory
+                .read_volatile_from(
+                    GuestAddress(e.gpa + offset),
+                    &mut file,
+                    (e.length - offset) as usize,
+                )
+                .map_err(Error::SnapshotCopy)?;
+            if n == 0 {
+                return Err(Error::SnapshotRead(io::Error::from(
+                    io::ErrorKind::UnexpectedEof,
+                )));
+            }
+            offset += n as u64;
+        }
+    }
+    Ok(())
 }
 
 // Reports whether every saved range is page-aligned and lies wholly inside a
@@ -4184,5 +4373,72 @@ mod tests {
             do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
             assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
         }
+    }
+
+    fn two_page_guest(fill: u8) -> (GuestMemoryMmap, MemoryRangeTable) {
+        let page = page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (2 * page) as usize)]).unwrap();
+        gm.write_slice(&vec![fill; (2 * page) as usize], GuestAddress(0))
+            .unwrap();
+        let mut layout = MemoryRangeTable::default();
+        layout.push(MemoryRange {
+            gpa: 0,
+            length: 2 * page,
+        });
+        (gm, layout)
+    }
+
+    #[test]
+    fn diff_file_replays_only_its_entries() {
+        let page = page_size();
+        let dir = tempfile::tempdir().unwrap();
+        let (source, layout) = two_page_guest(0xab);
+        let mut dirty = MemoryRangeTable::default();
+        dirty.push(MemoryRange {
+            gpa: page,
+            length: page,
+        });
+        write_diff_file(&source, dir.path(), 1, &layout, &dirty).unwrap();
+        assert!(!dir.path().join("memory-ranges.diff.1.tmp").exists());
+
+        let (target, _) = two_page_guest(0x11);
+        apply_diff_file(&target, &diff_file_path(dir.path(), 1), &layout).unwrap();
+        assert_eq!(target.read_obj::<u8>(GuestAddress(page - 1)).unwrap(), 0x11);
+        assert_eq!(target.read_obj::<u8>(GuestAddress(page)).unwrap(), 0xab);
+        assert_eq!(
+            target.read_obj::<u8>(GuestAddress(2 * page - 1)).unwrap(),
+            0xab
+        );
+    }
+
+    #[test]
+    fn diff_file_rejects_foreign_or_damaged_files() {
+        let page = page_size();
+        let dir = tempfile::tempdir().unwrap();
+        let (gm, layout) = two_page_guest(0x11);
+        let path = dir.path().join("diff");
+        let header = |gpa: u64, length: u64| {
+            let mut bytes = DIFF_SNAPSHOT_MAGIC.to_vec();
+            bytes.extend_from_slice(&1u64.to_le_bytes());
+            bytes.extend_from_slice(&gpa.to_le_bytes());
+            bytes.extend_from_slice(&length.to_le_bytes());
+            bytes
+        };
+        let rejects = |bytes: &[u8]| {
+            fs::write(&path, bytes).unwrap();
+            matches!(
+                apply_diff_file(&gm, &path, &layout),
+                Err(Error::RestoreDiffInvalid(..))
+            )
+        };
+
+        assert!(rejects(&vec![0xab; (2 * page) as usize]));
+        let mut outside = header(2 * page, page);
+        outside.extend(vec![0xab; page as usize]);
+        assert!(rejects(&outside));
+        let mut short = header(0, page);
+        short.extend(vec![0xab; (page / 2) as usize]);
+        assert!(rejects(&short));
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x11);
     }
 }
