@@ -265,10 +265,23 @@ pub struct VmRemoveDeviceData {
     pub id: String,
 }
 
+/// Type of a VM snapshot: full memory dump or dirty-pages-only delta.
+#[derive(Copy, Clone, Default, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VmSnapshotType {
+    /// Complete guest memory dump.
+    #[default]
+    Full,
+    /// Pages dirtied since the previous snapshot; the first diff is a full baseline.
+    Diff,
+}
+
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmSnapshotConfig {
     /// The snapshot destination URL
     pub destination_url: String,
+    #[serde(default)]
+    pub snapshot_type: VmSnapshotType,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -877,7 +890,7 @@ pub trait RequestHandler {
 
     fn vm_resume(&mut self) -> Result<(), VmError>;
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
+    fn vm_snapshot(&mut self, config: &VmSnapshotConfig) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
@@ -2072,7 +2085,7 @@ impl ApiAction for VmSnapshot {
             info!("API request event: VmSnapshot {config:?}");
 
             let response = vmm
-                .vm_snapshot(&config.destination_url)
+                .vm_snapshot(&config)
                 .map_err(ApiError::VmSnapshot)
                 .map(|_| ApiResponsePayload::Empty);
 
@@ -2638,5 +2651,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(data.effective_memory_mode(), MigrationMode::MemFDs);
+    }
+
+    #[test]
+    fn test_vm_snapshot_config_snapshot_type() {
+        let config: VmSnapshotConfig =
+            serde_json::from_str(r#"{"destination_url": "file:///foo"}"#).unwrap();
+        assert_eq!(config.snapshot_type, VmSnapshotType::Full);
+
+        let config: VmSnapshotConfig =
+            serde_json::from_str(r#"{"destination_url": "file:///foo", "snapshot_type": "diff"}"#)
+                .unwrap();
+        assert_eq!(config.snapshot_type, VmSnapshotType::Diff);
+
+        serde_json::from_str::<VmSnapshotConfig>(
+            r#"{"destination_url": "file:///foo", "snapshot_type": "bogus"}"#,
+        )
+        .unwrap_err();
     }
 }
