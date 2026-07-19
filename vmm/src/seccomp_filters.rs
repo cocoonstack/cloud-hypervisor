@@ -833,6 +833,12 @@ fn vmm_thread_rules(
         (libc::SYS_readlinkat, vec![]),
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_recvmsg, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_rename, vec![]),
+        #[cfg(target_arch = "aarch64")]
+        (libc::SYS_renameat, vec![]),
+        #[cfg(target_arch = "riscv64")]
+        (libc::SYS_renameat2, vec![]),
         (libc::SYS_restart_syscall, vec![]),
         (libc::SYS_rseq, vec![]),
         (libc::SYS_rt_sigreturn, vec![]),
