@@ -885,7 +885,9 @@ mod tests {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;
 
+    use vhost::vhost_kern::vhost_binding::VHOST_VRING_F_LOG;
     use vhost::vhost_user::message::{FrontendReq, VhostUserHeaderFlag};
+    use virtio_queue::QueueT;
     use vm_memory::{FileOffset, GuestAddress};
     use vm_migration::Snapshottable;
     use vmm_sys_util::tempdir::TempDir;
@@ -913,6 +915,16 @@ mod tests {
         reply.extend_from_slice(&(VhostUserHeaderFlag::REPLY.bits() | 1).to_ne_bytes());
         reply.extend_from_slice(&8u32.to_ne_bytes());
         reply.extend_from_slice(&value.to_ne_bytes());
+        stream.write_all(&reply).unwrap();
+    }
+
+    fn ack_log_base(stream: &mut UnixStream) {
+        let log = read_request(stream, FrontendReq::SET_LOG_BASE);
+        let mut reply = Vec::with_capacity(12 + log.len());
+        reply.extend_from_slice(&u32::from(FrontendReq::SET_LOG_BASE).to_ne_bytes());
+        reply.extend_from_slice(&(VhostUserHeaderFlag::REPLY.bits() | 1).to_ne_bytes());
+        reply.extend_from_slice(&(log.len() as u32).to_ne_bytes());
+        reply.extend_from_slice(&log);
         stream.write_all(&reply).unwrap();
     }
 
@@ -1088,6 +1100,153 @@ mod tests {
         )
         .unwrap();
         backend.join().unwrap();
+    }
+
+    fn vring_addr_flags(payload: &[u8]) -> u32 {
+        u32::from_ne_bytes(payload[4..8].try_into().unwrap())
+    }
+
+    // Runs setup on a handle with an active log that covers one u64 word of pages.
+    fn setup_with_active_log(
+        mem_size: u64,
+        backend_check: impl FnOnce(&mut UnixStream) + Send + 'static,
+        handle_check: impl FnOnce(&mut VhostUserHandle),
+    ) {
+        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let log_all = VhostUserVirtioFeatures::LOG_ALL.bits();
+        let log_shmfd = VhostUserProtocolFeatures::LOG_SHMFD;
+        let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-log-").unwrap();
+        let socket_path = temp_dir.as_path().join("backend.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let backend = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+            assert!(read_request(&mut stream, FrontendReq::GET_FEATURES).is_empty());
+            write_reply(
+                &mut stream,
+                FrontendReq::GET_FEATURES,
+                protocol_features | log_all,
+            );
+            assert!(read_request(&mut stream, FrontendReq::GET_PROTOCOL_FEATURES).is_empty());
+            write_reply(
+                &mut stream,
+                FrontendReq::GET_PROTOCOL_FEATURES,
+                log_shmfd.bits(),
+            );
+            read_request(&mut stream, FrontendReq::SET_PROTOCOL_FEATURES);
+            ack_log_base(&mut stream);
+            read_request(&mut stream, FrontendReq::SET_FEATURES);
+            backend_check(&mut stream);
+        });
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temp_dir.as_path().join("memory"))
+            .unwrap();
+        file.set_len(mem_size).unwrap();
+        let mem = GuestMemory::from_ranges_with_files(&[(
+            GuestAddress(0),
+            mem_size as usize,
+            Some(FileOffset::new(file, 0)),
+        )])
+        .unwrap();
+        let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut vu = VhostUserHandle::connect_vhost_user(
+            false,
+            socket_path.to_str().unwrap(),
+            1,
+            false,
+            &kill_evt,
+            |_| Ok(()),
+        )
+        .unwrap();
+        vu.negotiate_features_vhost_user(protocol_features | log_all, log_shmfd)
+            .unwrap();
+        vu.start_dirty_log(0xfff).unwrap();
+
+        struct BackendReqHandler;
+        impl VhostUserFrontendReqHandler for BackendReqHandler {}
+        let queues = [(
+            0u16,
+            Queue::new(2).unwrap(),
+            EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+        )];
+        vu.setup_vhost_user::<BackendReqHandler>(
+            &mem,
+            &queues,
+            &NoopVirtioInterrupt {},
+            protocol_features,
+            &None,
+            None,
+            Some(&[0]),
+        )
+        .unwrap();
+        handle_check(&mut vu);
+        backend.join().unwrap();
+    }
+
+    #[test]
+    fn setup_rearms_active_dirty_log_before_enabling_vrings() {
+        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let log_all = VhostUserVirtioFeatures::LOG_ALL.bits();
+        setup_with_active_log(
+            0x1000,
+            move |stream| {
+                assert_eq!(
+                    read_request(stream, FrontendReq::SET_FEATURES),
+                    (protocol_features | log_all).to_ne_bytes()
+                );
+                read_request(stream, FrontendReq::SET_MEM_TABLE);
+                ack_log_base(stream);
+                read_request(stream, FrontendReq::SET_VRING_NUM);
+                assert_eq!(
+                    vring_addr_flags(&read_request(stream, FrontendReq::SET_VRING_ADDR)),
+                    0
+                );
+                read_request(stream, FrontendReq::SET_VRING_BASE);
+                read_request(stream, FrontendReq::SET_VRING_KICK);
+                assert_eq!(
+                    vring_addr_flags(&read_request(stream, FrontendReq::SET_VRING_ADDR)),
+                    1 << VHOST_VRING_F_LOG
+                );
+                read_request(stream, FrontendReq::SET_VRING_ENABLE);
+                assert_eq!(
+                    vring_addr_flags(&read_request(stream, FrontendReq::SET_VRING_ADDR)),
+                    0
+                );
+                assert_eq!(
+                    read_request(stream, FrontendReq::SET_FEATURES),
+                    protocol_features.to_ne_bytes()
+                );
+            },
+            |vu| vu.stop_dirty_log().unwrap(),
+        );
+    }
+
+    #[test]
+    fn setup_stays_unlogged_when_memory_outgrew_the_log() {
+        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        setup_with_active_log(
+            0x41000,
+            move |stream| {
+                assert_eq!(
+                    read_request(stream, FrontendReq::SET_FEATURES),
+                    protocol_features.to_ne_bytes()
+                );
+                read_request(stream, FrontendReq::SET_MEM_TABLE);
+                read_request(stream, FrontendReq::SET_VRING_NUM);
+                assert_eq!(
+                    vring_addr_flags(&read_request(stream, FrontendReq::SET_VRING_ADDR)),
+                    0
+                );
+                read_request(stream, FrontendReq::SET_VRING_BASE);
+                read_request(stream, FrontendReq::SET_VRING_KICK);
+                read_request(stream, FrontendReq::SET_VRING_ENABLE);
+            },
+            |_| {},
+        );
     }
 
     #[test]
