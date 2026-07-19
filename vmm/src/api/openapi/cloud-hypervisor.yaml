@@ -1475,6 +1475,14 @@ components:
       properties:
         destination_url:
           type: string
+        snapshot_type:
+          type: string
+          enum: [full, diff]
+          default: full
+          description:
+            With "diff", only pages dirtied since the previous snapshot of the
+            series are written; the first "diff" takes a full baseline and
+            starts dirty tracking.
 
     VmCoredumpData:
       type: object

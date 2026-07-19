@@ -3067,6 +3067,14 @@ impl Vm {
         self.memory_manager.lock().unwrap().memory_range_table(mode)
     }
 
+    /// Restricts the next snapshot send to the given dirty ranges (diff snapshot).
+    pub fn set_diff_snapshot_ranges(&mut self, table: MemoryRangeTable) {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .set_diff_snapshot_ranges(table);
+    }
+
     pub fn guest_memory(&self) -> GuestMemoryAtomic<GuestMemoryMmap> {
         self.memory_manager.lock().unwrap().guest_memory()
     }

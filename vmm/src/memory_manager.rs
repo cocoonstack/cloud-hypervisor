@@ -226,6 +226,9 @@ pub struct MemoryManager {
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    // When set, Transportable::send writes only these dirty ranges, placed at
+    // their offsets within the full snapshot layout (diff snapshot).
+    diff_snapshot_ranges: Option<MemoryRangeTable>,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -1916,6 +1919,7 @@ impl MemoryManager {
             reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            diff_snapshot_ranges: None,
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
@@ -3289,12 +3293,23 @@ pub struct MemoryManagerSnapshotData {
     next_hotplug_slot: usize,
 }
 
+impl MemoryManager {
+    /// Restricts the next Transportable::send to the given dirty ranges,
+    /// written at their offsets within the full snapshot layout.
+    pub fn set_diff_snapshot_ranges(&mut self, table: MemoryRangeTable) {
+        self.diff_snapshot_ranges = Some(table);
+    }
+}
+
 impl Snapshottable for MemoryManager {
     fn id(&self) -> String {
         MEMORY_MANAGER_SNAPSHOT_ID.to_string()
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        // A stale diff table must not leak into this snapshot; the caller
+        // re-injects one after device capture when a diff is requested.
+        self.diff_snapshot_ranges = None;
         let memory_ranges = self.memory_range_table(MemoryRangePolicy::SkipPersisted)?;
 
         // Store locally this list of ranges as it will be used through the
@@ -3324,7 +3339,13 @@ impl Transportable for MemoryManager {
         }
 
         let mut memory_file_path = url_to_path(destination_url)?;
-        memory_file_path.push(String::from(SNAPSHOT_FILENAME));
+        // A diff file only carries dirty extents; the distinct name makes
+        // restoring an un-rebased delta fail loudly (memory file missing).
+        memory_file_path.push(if self.diff_snapshot_ranges.is_some() {
+            format!("{SNAPSHOT_FILENAME}.diff")
+        } else {
+            String::from(SNAPSHOT_FILENAME)
+        });
 
         let mut memory_file = OpenOptions::new()
             .read(true)
@@ -3350,10 +3371,44 @@ impl Transportable for MemoryManager {
         // write path which never writes past the growing EOF.
         let sparse_layout = memory_file.set_len(total_len).is_ok();
 
-        let guest_memory = self.guest_memory.memory();
-        let mut file_cursor: u64 = 0;
+        // (file offset, range) pairs: a full snapshot lays ranges out densely;
+        // a diff places each dirty range at its offset within that same layout
+        // so its extents apply onto a base snapshot without translation.
+        let mut write_plan: Vec<(u64, MemoryRange)> = Vec::new();
+        let mut layout_cursor: u64 = 0;
+        for full in self.snapshot_memory_ranges.regions() {
+            match &self.diff_snapshot_ranges {
+                None => write_plan.push((
+                    layout_cursor,
+                    MemoryRange {
+                        gpa: full.gpa,
+                        length: full.length,
+                    },
+                )),
+                Some(dirty) => {
+                    for d in dirty.regions() {
+                        let start = d.gpa.max(full.gpa);
+                        let end = (d.gpa + d.length).min(full.gpa + full.length);
+                        if start < end {
+                            write_plan.push((
+                                layout_cursor + (start - full.gpa),
+                                MemoryRange {
+                                    gpa: start,
+                                    length: end - start,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            layout_cursor += full.length;
+        }
+        debug_assert_eq!(layout_cursor, total_len);
 
-        for range in self.snapshot_memory_ranges.regions() {
+        let guest_memory = self.guest_memory.memory();
+
+        for (file_cursor, range) in write_plan {
+            let range = &range;
             let mut wrote_sparse = false;
             if sparse_layout
                 && let Some(region) = guest_memory.find_region(GuestAddress(range.gpa))
@@ -3404,11 +3459,8 @@ impl Transportable for MemoryManager {
                     }
                 }
             }
-
-            file_cursor += range.length;
         }
 
-        debug_assert_eq!(file_cursor, total_len);
         Ok(())
     }
 }
