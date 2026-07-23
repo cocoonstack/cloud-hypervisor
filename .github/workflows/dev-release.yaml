@@ -25,10 +25,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install pinned Rust toolchain
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.89.0"
+          toolchain: stable
 
       - name: Show toolchain
         run: |
