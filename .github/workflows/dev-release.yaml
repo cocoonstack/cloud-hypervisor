@@ -1,0 +1,110 @@
+name: Build and Release Dev
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dev-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Show toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Build cloud-hypervisor (release)
+        run: cargo build --release
+
+      - name: Stage artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp -v target/release/cloud-hypervisor "dist/cloud-hypervisor-${{ matrix.arch }}"
+          "./dist/cloud-hypervisor-${{ matrix.arch }}" --version
+          rustc --version --verbose | tr '\n' ';' > "dist/rustc-${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Add provenance and checksums
+        run: |
+          set -euo pipefail
+          chmod +x dist/*-x86_64 dist/*-aarch64
+          version=$(./dist/cloud-hypervisor-x86_64 --version | awk 'NR==1 {v=$2} END {print v}')
+          cat > dist/build-info.json <<EOF
+          {
+            "version": "${version}",
+            "ref": "${GITHUB_REF_NAME}",
+            "commit": "${GITHUB_SHA}",
+            "run_id": "${GITHUB_RUN_ID}",
+            "run_attempt": "${GITHUB_RUN_ATTEMPT}",
+            "workflow": "${GITHUB_WORKFLOW}",
+            "rustc_x86_64": "$(cat dist/rustc-x86_64.txt)",
+            "rustc_aarch64": "$(cat dist/rustc-aarch64.txt)"
+          }
+          EOF
+          rm -f dist/rustc-*.txt
+          (cd dist && find . -type f -not -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Create dev release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: dev
+          target_commitish: ${{ github.sha }}
+          name: Dev Build
+          body: |
+            Branch: `${{ github.ref_name }}`
+            Commit: `${{ github.sha }}`
+            Workflow Run: `${{ github.run_id }}`
+          files: dist/*
+          prerelease: true
+          make_latest: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move dev tag to current commit
+        run: |
+          git tag -f dev "${GITHUB_SHA}"
+          git push origin refs/tags/dev --force
