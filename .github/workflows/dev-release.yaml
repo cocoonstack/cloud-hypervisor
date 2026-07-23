@@ -13,11 +13,17 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+      - uses: actions/checkout@v7
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -30,36 +36,58 @@ jobs:
           cargo --version --verbose
 
       - name: Build cloud-hypervisor (release)
-        run: |
-          cargo build --release
+        run: cargo build --release
 
-      - name: Generate checksum and build metadata
+      - name: Stage artifacts
         run: |
-          artifact=target/release/cloud-hypervisor
-          sha256sum "$artifact" > "${artifact}.sha256"
-          cat > target/release/build-info.json <<EOF
+          set -euo pipefail
+          mkdir -p dist
+          cp -v target/release/cloud-hypervisor "dist/cloud-hypervisor-${{ matrix.arch }}"
+          "./dist/cloud-hypervisor-${{ matrix.arch }}" --version
+          rustc --version --verbose | tr '\n' ';' > "dist/rustc-${{ matrix.arch }}.txt"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Add provenance and checksums
+        run: |
+          set -euo pipefail
+          chmod +x dist/*-x86_64 dist/*-aarch64
+          version=$(./dist/cloud-hypervisor-x86_64 --version | head -1 | awk '{print $2}')
+          cat > dist/build-info.json <<EOF
           {
+            "version": "${version}",
             "ref": "${GITHUB_REF_NAME}",
             "commit": "${GITHUB_SHA}",
             "run_id": "${GITHUB_RUN_ID}",
             "run_attempt": "${GITHUB_RUN_ATTEMPT}",
             "workflow": "${GITHUB_WORKFLOW}",
-            "rustc": "$(rustc --version --verbose | tr '\n' '; ' | sed 's/; $//')",
-            "cargo": "$(cargo --version --verbose | tr '\n' '; ' | sed 's/; $//')"
+            "rustc_x86_64": "$(cat dist/rustc-x86_64.txt)",
+            "rustc_aarch64": "$(cat dist/rustc-aarch64.txt)"
           }
           EOF
-
-      - name: Upload binary as artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: cloud-hypervisor
-          path: |
-            target/release/cloud-hypervisor
-            target/release/cloud-hypervisor.sha256
-            target/release/build-info.json
+          rm -f dist/rustc-*.txt
+          (cd dist && find . -type f -not -name SHA256SUMS | sort | xargs sha256sum > SHA256SUMS)
+          cat dist/SHA256SUMS
 
       - name: Create dev release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: dev
           target_commitish: ${{ github.sha }}
@@ -68,10 +96,7 @@ jobs:
             Branch: `${{ github.ref_name }}`
             Commit: `${{ github.sha }}`
             Workflow Run: `${{ github.run_id }}`
-          files: |
-            target/release/cloud-hypervisor
-            target/release/cloud-hypervisor.sha256
-            target/release/build-info.json
+          files: dist/*
           prerelease: true
           make_latest: false
           overwrite_files: true
