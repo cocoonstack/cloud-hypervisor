@@ -171,7 +171,14 @@ impl DiskFormat for Qcow2Chain {
             }
         }
 
-        let disk = QcowDisk::new(file, config.direct, config.backing, config.sparse, false)?;
+        let disk = QcowDisk::new(
+            file,
+            config.direct,
+            None,
+            config.backing,
+            config.sparse,
+            false,
+        )?;
         Ok(Box::new(disk))
     }
 }
