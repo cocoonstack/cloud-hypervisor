@@ -1566,7 +1566,7 @@ mod tests {
 
     // Return the raw state so dropping it can model an unclean close.
     fn open_state(image: &TestImage) -> super::QcowState {
-        super::super::parser::parse_qcow(image.aligned_file(), 0, true)
+        super::super::parser::parse_qcow(image.aligned_file(), 0, true, false)
             .unwrap()
             .0
     }
@@ -1885,7 +1885,8 @@ mod tests {
                     .open(temp.as_path())
                     .unwrap();
                 let raw = crate::AlignedFile::new(file, false);
-                let (mut state, _, _) = super::super::parser::parse_qcow(raw, 0, true).unwrap();
+                let (mut state, _, _) =
+                    super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
                 state.l2_cache = super::super::vec_cache::CacheMap::new(1);
                 let before = temp.snapshot();
                 for address in [0, l2_coverage * shared_index as u64] {

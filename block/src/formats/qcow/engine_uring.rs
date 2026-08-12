@@ -315,6 +315,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp_file.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             sparse,
             true,
@@ -344,6 +345,7 @@ mod tests {
         let disk = QcowDisk::new(
             overlay_temp.as_file().try_clone().unwrap(),
             false,
+            None,
             true,
             true,
             true,
@@ -486,6 +488,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp_file.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             true,
@@ -567,6 +570,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp_file.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             true,
@@ -603,6 +607,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp_file.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             true,
@@ -687,6 +692,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp_file.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             true,
@@ -710,6 +716,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp_file.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             true,
@@ -834,6 +841,7 @@ mod tests {
             QcowDisk::new(
                 temp.as_file().try_clone().unwrap(),
                 false,
+                None,
                 false,
                 false,
                 true,
