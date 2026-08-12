@@ -1187,7 +1187,7 @@ mod tests {
             .into_tempfile();
         let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
         let (mut inner, _backing, _sparse) =
-            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
 
         // Materialize an L2 table plus one data cluster, then flush so the
         // next write to the region takes the relocate-on-write path.
@@ -1258,7 +1258,7 @@ mod tests {
             .into_tempfile();
         let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
         let (mut inner, _backing, _sparse) =
-            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
 
         inner.map_write(0, None).expect("initial write");
         inner.sync_caches().expect("flush");
@@ -1336,7 +1336,7 @@ mod tests {
             .into_tempfile();
         let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
         let (mut inner, _backing, _sparse) =
-            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
 
         inner.map_write(0, None).expect("initial write");
         inner.sync_caches().expect("flush");
@@ -1405,7 +1405,7 @@ mod tests {
         {
             let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
             let (mut inner, _backing, _sparse) =
-                super::super::parser::parse_qcow(raw, 0, true).unwrap();
+                super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
             inner
                 .map_write(0, Some(vec![0xab; cluster_size as usize]))
                 .expect("seed write");
@@ -1418,7 +1418,7 @@ mod tests {
         // Re-open so the L2 cache reflects the on-disk compressed entry.
         let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
         let (mut inner, _backing, _sparse) =
-            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
         let live_l2 = inner.l1_table[0];
         assert_ne!(live_l2, 0);
 
@@ -1483,7 +1483,7 @@ mod tests {
         let live_l2 = {
             let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
             let (mut inner, _backing, _sparse) =
-                super::super::parser::parse_qcow(raw, 0, true).unwrap();
+                super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
             assert_eq!(inner.l1_table[0], 0);
 
             // Add exactly two addressable clusters and cap file growth there. On
@@ -1527,7 +1527,7 @@ mod tests {
 
         let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
         let (mut reopened, _backing, _sparse) =
-            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
         assert_eq!(reopened.l1_table[0], live_l2);
 
         let live_refcount = {
@@ -1565,7 +1565,7 @@ mod tests {
             .into_tempfile();
         let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
         let (mut inner, _backing, _sparse) =
-            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
 
         inner.map_write(0, None).expect("initial write");
         inner.sync_caches().expect("make the current L2 clean");
@@ -1635,7 +1635,7 @@ mod tests {
             .into_tempfile();
         let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
         let (mut inner, _backing, _sparse) =
-            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
         assert_eq!(inner.l1_table[0], 0);
 
         inner

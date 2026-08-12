@@ -87,6 +87,7 @@ impl QcowDisk {
     pub fn new(
         file: File,
         direct_io: bool,
+        backing_direct: Option<bool>,
         backing_files: bool,
         sparse: bool,
         use_io_uring: bool,
@@ -103,8 +104,9 @@ impl QcowDisk {
 
         let max_nesting_depth = if backing_files { MAX_NESTING_DEPTH } else { 0 };
         let raw_file = AlignedFile::new(file, direct_io);
-        let (inner, backing_file, sparse) = parse_qcow(raw_file, max_nesting_depth, sparse)
-            .map_err(|e| {
+        let backing_direct = backing_direct.unwrap_or(direct_io);
+        let (inner, backing_file, sparse) =
+            parse_qcow(raw_file, max_nesting_depth, sparse, backing_direct).map_err(|e| {
                 let e = if !backing_files && matches!(e.kind(), BlockErrorKind::Overflow) {
                     e.with_kind(BlockErrorKind::UnsupportedFeature)
                 } else {
@@ -182,7 +184,7 @@ pub(crate) fn create_image(
     header
         .write_to(&raw)
         .map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
-    let (inner, _backing, _sparse) = parse_qcow(raw, MAX_NESTING_DEPTH, true)?;
+    let (inner, _backing, _sparse) = parse_qcow(raw, MAX_NESTING_DEPTH, true, false)?;
     // Flush dirty caches and clear the dirty bit
     QcowMetadata::new(inner).shutdown();
     Ok(())
@@ -215,6 +217,7 @@ impl QcowTempDisk {
         let disk = QcowDisk::new(
             file,
             direct_io,
+            None,
             backing_config.is_some(),
             sparse,
             use_io_uring,
@@ -368,7 +371,7 @@ mod tests {
     #[test]
     fn new_sync_returns_correct_size() {
         let file = make_qcow_file();
-        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let disk = QcowDisk::new(file, false, None, false, true, false).unwrap();
         assert_eq!(disk.logical_size().unwrap(), TEST_SIZE);
     }
 
@@ -384,7 +387,7 @@ mod tests {
     #[test]
     fn sync_backend_disables_batch_requests() {
         let file = make_qcow_file();
-        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let disk = QcowDisk::new(file, false, None, false, true, false).unwrap();
         assert_async_io(&disk, false);
     }
 
@@ -392,14 +395,14 @@ mod tests {
     #[test]
     fn io_uring_backend_enables_batch_requests() {
         let file = make_qcow_file();
-        let disk = QcowDisk::new(file, false, false, true, true).unwrap();
+        let disk = QcowDisk::new(file, false, None, false, true, true).unwrap();
         assert_async_io(&disk, true);
     }
 
     #[test]
     fn try_clone_preserves_sync_dispatch() {
         let file = make_qcow_file();
-        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let disk = QcowDisk::new(file, false, None, false, true, false).unwrap();
         let cloned = disk.try_clone().unwrap();
         assert_async_io_from_dyn(cloned.as_ref(), false);
     }
@@ -407,7 +410,7 @@ mod tests {
     #[test]
     fn dropping_clone_does_not_clear_dirty_bit() {
         let file = make_qcow_file();
-        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let disk = QcowDisk::new(file, false, None, false, true, false).unwrap();
         let cloned = disk.try_clone().unwrap();
 
         drop(cloned);
@@ -422,7 +425,7 @@ mod tests {
     fn async_io_clears_dirty_bit_when_last_metadata_owner_drops() {
         let file = make_qcow_file();
         let inspect = file.try_clone().unwrap();
-        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let disk = QcowDisk::new(file, false, None, false, true, false).unwrap();
         let async_io = disk.create_async_io(1).unwrap();
 
         drop(disk);
@@ -436,7 +439,7 @@ mod tests {
     #[test]
     fn try_clone_preserves_io_uring_dispatch() {
         let file = make_qcow_file();
-        let disk = QcowDisk::new(file, false, false, true, true).unwrap();
+        let disk = QcowDisk::new(file, false, None, false, true, true).unwrap();
         let cloned = disk.try_clone().unwrap();
         assert_async_io_from_dyn(cloned.as_ref(), true);
     }
@@ -446,7 +449,7 @@ mod tests {
         // make_qcow_file() writes no guest data, so the file on disk
         // only contains QCOW2 headers and metadata tables.
         let file = make_qcow_file();
-        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let disk = QcowDisk::new(file, false, None, false, true, false).unwrap();
         assert!(disk.physical_size().unwrap() < disk.logical_size().unwrap());
     }
 }
