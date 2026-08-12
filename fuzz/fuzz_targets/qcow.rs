@@ -32,7 +32,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     disk_file.write_all(&bytes[16..]).unwrap();
     disk_file.seek(SeekFrom::Start(0)).unwrap();
 
-    let Ok(disk) = QcowDisk::new(disk_file, false, false, true, false) else {
+    let Ok(disk) = QcowDisk::new(disk_file, false, None, false, true, false) else {
         return Corpus::Keep;
     };
     let Ok(mut async_io) = disk.create_async_io(1) else {
