@@ -1578,7 +1578,8 @@ impl DiskConfig {
          id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
          rate_limit_group=<group_id>,\
          queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
-         serial=<serial_number>,backing_files=on|off,sparse=on|off,\
+         serial=<serial_number>,backing_files=on|off,backing_direct=on|off,\
+         sparse=on|off,\
          image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
          guest_block_size=<size_in_bytes>";
 
@@ -1604,6 +1605,7 @@ impl DiskConfig {
             .add("rate_limit_group")
             .add("queue_affinity")
             .add("backing_files")
+            .add("backing_direct")
             .add("sparse")
             .add("image_type")
             .add("lock_granularity")
@@ -1690,6 +1692,10 @@ impl DiskConfig {
             .map_err(Error::ParseDisk)?
             .unwrap_or(Toggle(false))
             .0;
+        let backing_direct = parser
+            .convert::<Toggle>("backing_direct")
+            .map_err(Error::ParseDisk)?
+            .map(|t| t.0);
 
         let image_type = if vhost_socket.is_none() {
             parser
@@ -1759,6 +1765,7 @@ impl DiskConfig {
             serial,
             queue_affinity,
             backing_files,
+            backing_direct,
             sparse,
             image_type,
             lock_granularity,
@@ -4840,6 +4847,7 @@ mod tests {
             serial: None,
             queue_affinity: None,
             backing_files: false,
+            backing_direct: None,
             sparse: true,
             image_type: ImageType::Unknown,
             lock_granularity: LockGranularityChoice::default(),
@@ -4924,6 +4932,14 @@ mod tests {
             DiskConfig::parse("path=/path/to_file,serial=test")?,
             DiskConfig {
                 serial: Some(String::from("test")),
+                ..disk_fixture()
+            }
+        );
+        assert_eq!(
+            DiskConfig::parse("path=/path/to_file,direct=on,backing_direct=off")?,
+            DiskConfig {
+                direct: true,
+                backing_direct: Some(false),
                 ..disk_fixture()
             }
         );
