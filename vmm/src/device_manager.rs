@@ -2748,6 +2748,7 @@ impl DeviceManager {
                 direct: disk_cfg.direct,
                 sparse: disk_cfg.sparse,
                 backing_files: disk_cfg.backing_files,
+                backing_direct: disk_cfg.backing_direct,
                 disable_io_uring: disk_cfg.disable_io_uring,
                 disable_aio: disk_cfg.disable_aio,
             })

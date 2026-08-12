@@ -1161,7 +1161,7 @@ mod unit_tests {
             .into_tempfile();
         let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
         let (mut inner, _backing, _sparse) =
-            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
 
         // Materialize an L2 table plus one data cluster, then flush so the
         // next write to the region takes the relocate-on-write path.
@@ -1239,7 +1239,7 @@ mod unit_tests {
         {
             let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
             let (mut inner, _backing, _sparse) =
-                super::super::parser::parse_qcow(raw, 0, true).unwrap();
+                super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
             inner
                 .map_write(0, Some(vec![0xab; cluster_size as usize]))
                 .expect("seed write");
@@ -1252,7 +1252,7 @@ mod unit_tests {
         // Re-open so the L2 cache reflects the on-disk compressed entry.
         let raw = crate::AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
         let (mut inner, _backing, _sparse) =
-            super::super::parser::parse_qcow(raw, 0, true).unwrap();
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
         let live_l2 = inner.l1_table[0];
         assert_ne!(live_l2, 0);
 

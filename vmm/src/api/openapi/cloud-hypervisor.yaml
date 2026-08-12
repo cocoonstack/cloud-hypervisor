@@ -1090,6 +1090,9 @@ components:
         backing_files:
           type: boolean
           default: false
+        backing_direct:
+          type: boolean
+          description: Cache mode for the QCOW2 backing chain; absent follows direct.
         sparse:
           type: boolean
           default: true
