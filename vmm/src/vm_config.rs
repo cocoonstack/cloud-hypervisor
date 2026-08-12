@@ -410,6 +410,9 @@ pub struct DiskConfig {
     pub queue_affinity: Option<Box<[VirtQueueAffinity]>>,
     #[serde(default)]
     pub backing_files: bool,
+    /// Cache mode for the QCOW2 backing chain; `None` follows `direct`.
+    #[serde(default)]
+    pub backing_direct: Option<bool>,
     #[serde(default = "default_diskconfig_sparse")]
     pub sparse: bool,
     #[serde(default)]

@@ -57,6 +57,7 @@ pub fn qcow_tempfile(num_clusters: usize) -> (TempFile, QcowDisk) {
     let disk = QcowDisk::new(
         tmp.as_file().try_clone().unwrap(),
         false,
+        None,
         false,
         true,
         false,
@@ -69,8 +70,15 @@ pub fn qcow_tempfile(num_clusters: usize) -> (TempFile, QcowDisk) {
 /// via QcowDisk with io_uring backend.
 pub fn qcow_async_tempfile(num_clusters: usize) -> (TempFile, QcowDisk) {
     let tmp = create_qcow_tempfile(num_clusters);
-    let disk = QcowDisk::new(tmp.as_file().try_clone().unwrap(), false, false, true, true)
-        .expect("failed to open QCOW2 via QcowDisk");
+    let disk = QcowDisk::new(
+        tmp.as_file().try_clone().unwrap(),
+        false,
+        None,
+        false,
+        true,
+        true,
+    )
+    .expect("failed to open QCOW2 via QcowDisk");
     (tmp, disk)
 }
 
@@ -204,6 +212,7 @@ pub fn empty_qcow_tempfile(num_clusters: usize) -> (TempFile, QcowDisk) {
     let disk = QcowDisk::new(
         tmp.as_file().try_clone().unwrap(),
         false,
+        None,
         false,
         true,
         false,
@@ -215,8 +224,15 @@ pub fn empty_qcow_tempfile(num_clusters: usize) -> (TempFile, QcowDisk) {
 /// Empty QCOW2 opened via QcowDisk with io_uring backend.
 pub fn empty_qcow_async_tempfile(num_clusters: usize) -> (TempFile, QcowDisk) {
     let tmp = create_empty_qcow_tempfile(num_clusters);
-    let disk = QcowDisk::new(tmp.as_file().try_clone().unwrap(), false, false, true, true)
-        .expect("failed to open QCOW2 via QcowDisk");
+    let disk = QcowDisk::new(
+        tmp.as_file().try_clone().unwrap(),
+        false,
+        None,
+        false,
+        true,
+        true,
+    )
+    .expect("failed to open QCOW2 via QcowDisk");
     (tmp, disk)
 }
 
@@ -253,6 +269,7 @@ pub fn qcow_overlay_tempfile(num_clusters: usize) -> (TempFile, TempFile, QcowDi
     let disk = QcowDisk::new(
         overlay.as_file().try_clone().unwrap(),
         false,
+        None,
         true,
         true,
         false,
@@ -267,6 +284,7 @@ pub fn qcow_async_overlay_tempfile(num_clusters: usize) -> (TempFile, TempFile, 
     let disk = QcowDisk::new(
         overlay.as_file().try_clone().unwrap(),
         false,
+        None,
         true,
         true,
         true,
@@ -321,6 +339,7 @@ pub fn compressed_qcow_tempfile(num_clusters: usize) -> (TempFile, QcowDisk) {
     let disk = QcowDisk::new(
         File::open(&path).expect("failed to open compressed qcow2"),
         false,
+        None,
         false,
         true,
         false,
@@ -336,6 +355,7 @@ pub fn compressed_qcow_async_tempfile(num_clusters: usize) -> (TempFile, QcowDis
     let disk = QcowDisk::new(
         File::open(&path).expect("failed to open compressed qcow2"),
         false,
+        None,
         false,
         true,
         true,
@@ -368,6 +388,7 @@ pub fn sparse_qcow_tempfile(num_l2_tables: usize) -> (TempFile, QcowDisk) {
     let disk = QcowDisk::new(
         tmp.as_file().try_clone().unwrap(),
         false,
+        None,
         false,
         true,
         false,
@@ -379,8 +400,15 @@ pub fn sparse_qcow_tempfile(num_l2_tables: usize) -> (TempFile, QcowDisk) {
 /// Sparse QCOW2 opened via QcowDisk with io_uring backend.
 pub fn sparse_qcow_async_tempfile(num_l2_tables: usize) -> (TempFile, QcowDisk) {
     let tmp = create_sparse_qcow_tempfile(num_l2_tables);
-    let disk = QcowDisk::new(tmp.as_file().try_clone().unwrap(), false, false, true, true)
-        .expect("failed to open QCOW2 via QcowDisk");
+    let disk = QcowDisk::new(
+        tmp.as_file().try_clone().unwrap(),
+        false,
+        None,
+        false,
+        true,
+        true,
+    )
+    .expect("failed to open QCOW2 via QcowDisk");
     (tmp, disk)
 }
 

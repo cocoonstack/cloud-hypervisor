@@ -36,6 +36,8 @@ pub struct DiskOpenOptions<'a> {
     pub direct: bool,
     pub sparse: bool,
     pub backing_files: bool,
+    /// Cache mode for the QCOW2 backing chain; `None` follows `direct`.
+    pub backing_direct: Option<bool>,
     pub disable_io_uring: bool,
     pub disable_aio: bool,
 }
@@ -179,6 +181,7 @@ fn open_qcow2(
                 QcowDisk::new(
                     file,
                     options.direct,
+                    options.backing_direct,
                     options.backing_files,
                     options.sparse,
                     true,
@@ -194,6 +197,7 @@ fn open_qcow2(
         QcowDisk::new(
             file,
             options.direct,
+            options.backing_direct,
             options.backing_files,
             options.sparse,
             false,
@@ -229,6 +233,7 @@ mod tests {
             direct: false,
             sparse: false,
             backing_files: false,
+            backing_direct: None,
             disable_io_uring: true,
             disable_aio: true,
         }
@@ -302,6 +307,7 @@ mod tests {
             direct: false,
             sparse: false,
             backing_files: false,
+            backing_direct: None,
             disable_io_uring: true,
             disable_aio: true,
         };
