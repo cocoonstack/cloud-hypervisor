@@ -103,6 +103,7 @@ impl TestImage {
         QcowDisk::new(
             file,
             options.direct_io,
+            None,
             options.backing_files,
             options.sparse,
             options.use_io_uring,

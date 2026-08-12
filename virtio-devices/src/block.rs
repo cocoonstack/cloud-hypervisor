@@ -1430,6 +1430,7 @@ mod tests {
                 path: &path,
                 readonly: false,
                 direct: false,
+                backing_direct: None,
                 sparse: true,
                 backing_files: false,
                 disable_io_uring: true,
