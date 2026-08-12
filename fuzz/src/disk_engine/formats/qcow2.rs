@@ -52,7 +52,7 @@ impl DiskFormat for Qcow2 {
         _path: Option<&Path>,
         config: &OpenConfig,
     ) -> BlockResult<Box<dyn AsyncFullDiskFile>> {
-        let disk = QcowDisk::new(file, config.direct, false, config.sparse, false)?;
+        let disk = QcowDisk::new(file, config.direct, None, false, config.sparse, false)?;
         Ok(Box::new(disk))
     }
 

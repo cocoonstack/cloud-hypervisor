@@ -226,6 +226,7 @@ mod tests {
             direct,
             sparse: false,
             backing_files: false,
+            backing_direct: None,
             disable_io_uring: !use_io_uring,
             disable_aio: true,
         };

@@ -224,6 +224,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp_file.as_file().try_clone().unwrap(),
             direct_io,
+            None,
             false,
             sparse,
             false,
@@ -254,6 +255,7 @@ mod tests {
         let disk = QcowDisk::new(
             overlay_temp.as_file().try_clone().unwrap(),
             direct_io,
+            None,
             true,
             true,
             false,
@@ -424,6 +426,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             false,
             false,
@@ -451,6 +454,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             false,
@@ -528,6 +532,7 @@ mod tests {
             QcowDisk::new(
                 temp.as_file().try_clone().unwrap(),
                 false,
+                None,
                 false,
                 false,
                 false,
@@ -717,6 +722,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             false,
@@ -750,6 +756,7 @@ mod tests {
             let disk = QcowDisk::new(
                 _temp.as_file().try_clone().unwrap(),
                 false,
+                None,
                 false,
                 true,
                 false,
@@ -763,6 +770,7 @@ mod tests {
         let disk = QcowDisk::new(
             _temp.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             false,
@@ -907,7 +915,7 @@ mod tests {
             .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         // Read first cluster - should come from backing file
         let buf = async_read(&disk, 0, cluster_size as usize);
@@ -1004,8 +1012,15 @@ mod tests {
         create_raw_backing(&backing_path, &pattern);
         create_qcow2_overlay(&overlay_path, "backing.raw", file_size);
 
-        let disk =
-            QcowDisk::new(File::open(&overlay_path).unwrap(), false, true, true, false).unwrap();
+        let disk = QcowDisk::new(
+            File::open(&overlay_path).unwrap(),
+            false,
+            None,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
 
         let buf = async_read(&disk, 0, cluster_size as usize);
         assert_eq!(
@@ -1024,8 +1039,15 @@ mod tests {
 
         create_qcow2_overlay_header(&overlay_path, "missing.raw", file_size);
 
-        let err = QcowDisk::new(File::open(&overlay_path).unwrap(), false, true, true, false)
-            .unwrap_err();
+        let err = QcowDisk::new(
+            File::open(&overlay_path).unwrap(),
+            false,
+            None,
+            true,
+            true,
+            false,
+        )
+        .unwrap_err();
         assert!(matches!(err.kind(), BlockErrorKind::Io));
 
         let expected_path = test_dir
@@ -1058,8 +1080,15 @@ mod tests {
         create_raw_backing(&backing_path, &pattern);
         create_qcow2_overlay(&overlay_path, "../sibling/backing.raw", file_size);
 
-        let disk =
-            QcowDisk::new(File::open(&overlay_path).unwrap(), false, true, true, false).unwrap();
+        let disk = QcowDisk::new(
+            File::open(&overlay_path).unwrap(),
+            false,
+            None,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
 
         let buf = async_read(&disk, 0, cluster_size as usize);
         assert_eq!(
@@ -1081,8 +1110,15 @@ mod tests {
         create_raw_backing(&backing_path, &pattern);
         create_qcow2_overlay(&overlay_path, backing_path.to_str().unwrap(), file_size);
 
-        let disk =
-            QcowDisk::new(File::open(&overlay_path).unwrap(), false, true, true, false).unwrap();
+        let disk = QcowDisk::new(
+            File::open(&overlay_path).unwrap(),
+            false,
+            None,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
 
         let buf = async_read(&disk, 0, cluster_size as usize);
         assert_eq!(
@@ -1108,7 +1144,7 @@ mod tests {
         }
 
         let overlay_file = overlay_temp.into_file();
-        let err = QcowDisk::new(overlay_file, false, true, true, false).unwrap_err();
+        let err = QcowDisk::new(overlay_file, false, None, true, true, false).unwrap_err();
         assert!(matches!(err.kind(), BlockErrorKind::Io));
 
         match err.downcast_ref::<QcowError>() {
@@ -1207,7 +1243,7 @@ mod tests {
             .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         // Read first cluster - should come from QCOW2 backing
         let buf = async_read(&disk, 0, cluster_size as usize);
@@ -1323,7 +1359,7 @@ mod tests {
             .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = Arc::new(QcowDisk::new(file, direct_io, true, true, false).unwrap());
+        let disk = Arc::new(QcowDisk::new(file, direct_io, None, true, true, false).unwrap());
 
         let threads: Vec<_> = (0..8)
             .map(|t| {
@@ -1407,7 +1443,7 @@ mod tests {
         let overlay_temp = overlay.into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         // Cluster 0: mid wrote 0xBB
         let buf = async_read(&disk, 0, cluster_size as usize);
@@ -1475,7 +1511,7 @@ mod tests {
             .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         let written = vec![0xFFu8; cluster_size as usize];
         for &idx in &[0u64, 3, 7] {
@@ -1543,7 +1579,7 @@ mod tests {
                 .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         // Read cluster 2 (past backing virtual_size) - should be zeros
         let buf = async_read(&disk, backing_size, cluster_size as usize);
@@ -1587,7 +1623,7 @@ mod tests {
                 .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         // Read 2 clusters starting at cluster 1 (spans backing boundary)
         let read_len = cluster_size as usize * 2;
@@ -1639,7 +1675,7 @@ mod tests {
                 .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         // Read cluster 2 (past backing size) - should be zeros
         let buf = async_read(&disk, backing_size, cluster_size as usize);
@@ -1693,7 +1729,7 @@ mod tests {
             .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         // Read spanning clusters 1-2 boundary: 512 bytes before + 512 after
         let mid = cluster_size - 512;
@@ -1748,7 +1784,7 @@ mod tests {
             .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         let written = vec![0xFFu8; cluster_size as usize];
         async_write(&disk, 0, &written);
@@ -1866,7 +1902,7 @@ mod tests {
             .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, direct_io, true, true, false).unwrap();
+        let disk = QcowDisk::new(file, direct_io, None, true, true, false).unwrap();
 
         // Write 4KB at offset 4KB within cluster 0 (partial cluster)
         let write_offset = 4096u64;
@@ -1970,7 +2006,8 @@ mod tests {
         drop(disk);
 
         let raw = AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
-        let (inner, backing, sparse) = super::super::parser::parse_qcow(raw, 0, true).unwrap();
+        let (inner, backing, sparse) =
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
         assert!(backing.is_none());
         let refcount_bits = 1u64 << inner.header.refcount_order;
         let metadata = Arc::new(QcowMetadata::new(inner));
@@ -1997,6 +2034,7 @@ mod tests {
         let reopened = QcowDisk::new(
             temp.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             false,
@@ -2016,7 +2054,8 @@ mod tests {
         drop(disk);
 
         let raw = AlignedFile::new(temp.as_file().try_clone().unwrap(), false);
-        let (inner, backing, sparse) = super::super::parser::parse_qcow(raw, 0, true).unwrap();
+        let (inner, backing, sparse) =
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
         assert!(backing.is_none());
         let refcount_bits = 1u64 << inner.header.refcount_order;
         let writable_data_file = inner.raw_file.clone();
@@ -2130,7 +2169,7 @@ mod tests {
             .into_tempfile();
 
         let file = overlay_temp.as_file().try_clone().unwrap();
-        let mut disk = QcowDisk::new(file, false, true, true, false).unwrap();
+        let mut disk = QcowDisk::new(file, false, None, true, true, false).unwrap();
 
         assert_eq!(disk.logical_size().unwrap(), file_size);
         let result = disk.resize(file_size * 2);
@@ -2210,6 +2249,7 @@ mod tests {
         let disk = QcowDisk::new(
             temp.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             false,
             false,
@@ -2236,13 +2276,15 @@ mod tests {
 
         // Seed one allocated data cluster below L1[0].
         {
-            let disk = QcowDisk::new(file.try_clone().unwrap(), false, false, true, false).unwrap();
+            let disk =
+                QcowDisk::new(file.try_clone().unwrap(), false, None, false, true, false).unwrap();
             async_write(&disk, 0, &vec![0x11; CLUSTER_SIZE as usize]);
             async_fsync(&disk);
         }
 
         let raw = AlignedFile::new(file.try_clone().unwrap(), false);
-        let (inner, backing, sparse) = super::super::parser::parse_qcow(raw, 0, true).unwrap();
+        let (inner, backing, sparse) =
+            super::super::parser::parse_qcow(raw, 0, true, false).unwrap();
         assert!(backing.is_none());
         let data_file = inner.raw_file.clone();
         let metadata = Arc::new(QcowMetadata::new(inner));
@@ -2292,7 +2334,8 @@ mod tests {
         drop(aio);
         drop(metadata);
 
-        let reopened = QcowDisk::new(file.try_clone().unwrap(), false, false, true, false).unwrap();
+        let reopened =
+            QcowDisk::new(file.try_clone().unwrap(), false, None, false, true, false).unwrap();
         let read_back = async_read(&reopened, new_guest_offset, CLUSTER_SIZE as usize);
         assert!(read_back.iter().all(|&byte| byte == 0x5a));
     }

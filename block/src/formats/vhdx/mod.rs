@@ -151,6 +151,7 @@ mod tests {
             direct,
             sparse: false,
             backing_files: false,
+            backing_direct: None,
             disable_io_uring: true,
             disable_aio: true,
         };
