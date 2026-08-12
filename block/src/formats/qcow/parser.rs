@@ -201,17 +201,21 @@ impl BackingFile {
             }
             ImageType::Qcow2 => {
                 let (inner, nested_backing, _sparse) =
-                    parse_qcow(raw_file, max_nesting_depth - 1, sparse).map_err(|e| {
-                        let kind = e.kind();
-                        let source = e
-                            .into_source()
-                            .and_then(|s| s.downcast::<Error>().ok())
-                            .map(|qcow_err| Error::BackingFileOpen(config.path.clone(), qcow_err));
-                        match source {
-                            Some(err) => BlockError::new(kind, err),
-                            None => BlockError::from_kind(kind),
-                        }
-                    })?;
+                    parse_qcow(raw_file, max_nesting_depth - 1, sparse, direct_io).map_err(
+                        |e| {
+                            let kind = e.kind();
+                            let source = e
+                                .into_source()
+                                .and_then(|s| s.downcast::<Error>().ok())
+                                .map(|qcow_err| {
+                                    Error::BackingFileOpen(config.path.clone(), qcow_err)
+                                });
+                            match source {
+                                Some(err) => BlockError::new(kind, err),
+                                None => BlockError::from_kind(kind),
+                            }
+                        },
+                    )?;
                 let size = inner.header.size;
                 (
                     BackingKind::Qcow {
@@ -246,6 +250,7 @@ pub(crate) fn parse_qcow(
     file: AlignedFile,
     max_nesting_depth: u32,
     sparse: bool,
+    backing_direct: bool,
 ) -> BlockResult<(metadata::QcowState, Option<BackingFile>, bool)> {
     let mut header = QcowHeader::new(&file).map_err(|e| {
         let kind = match &e {
@@ -293,7 +298,6 @@ pub(crate) fn parse_qcow(
         ));
     }
 
-    let direct_io = file.is_direct();
     // QCOW2 relative backing paths are resolved from the image that stores
     // them. Resolve only the config passed to BackingFile::new(), leaving the
     // header copy unchanged so the original backing filename is preserved.
@@ -311,7 +315,7 @@ pub(crate) fn parse_qcow(
 
     let backing_file = BackingFile::new(
         backing_file_config.as_ref(),
-        direct_io,
+        backing_direct,
         max_nesting_depth,
         sparse,
     )?;
@@ -1007,7 +1011,7 @@ mod tests {
     fn try_open_header(header: &[u8]) -> BlockResult<QcowDisk> {
         let temp = tempfile_with_header(header);
         let file = temp.into_file();
-        QcowDisk::new(file, false, false, true, false)
+        QcowDisk::new(file, false, None, false, true, false)
     }
 
     fn try_open_qcow_header(header: &QcowHeader, backing_files: bool) -> BlockResult<QcowDisk> {
@@ -1016,7 +1020,7 @@ mod tests {
         header.write_to(&raw).expect("write header");
         drop(raw);
         let file = temp.into_file();
-        QcowDisk::new(file, false, backing_files, true, false)
+        QcowDisk::new(file, false, None, backing_files, true, false)
     }
 
     #[test]
@@ -1245,6 +1249,29 @@ mod tests {
         assert_ne!(flags & libc::O_DIRECT, 0);
     }
 
+    #[test]
+    fn raw_backing_file_uses_buffered_io() {
+        let tmp = TempFile::new().unwrap();
+        tmp.as_file().write_all(&[0u8; 4096]).unwrap();
+        let config = BackingFileConfig {
+            path: tmp.as_path().to_string_lossy().into_owned(),
+            format: Some(ImageType::Raw),
+        };
+
+        let backing = BackingFile::new(Some(&config), false, 1, false)
+            .unwrap()
+            .unwrap();
+        let (kind, _) = backing.into_kind();
+        let BackingKind::Raw(file) = kind else {
+            panic!("Expected raw backing file");
+        };
+
+        // SAFETY: file owns a valid descriptor for the duration of this call.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(flags & libc::O_DIRECT, 0);
+    }
+
     /// Helper to create a test file with header extensions
     fn create_header_with_extension(ext_type: u32, ext_data: &[u8]) -> (AlignedFile, QcowHeader) {
         let header = QcowHeader::create_for_size_and_path(3, 0x10_0000, None)
@@ -1459,6 +1486,7 @@ mod tests {
         let err = QcowDisk::new(
             File::open(img_path.as_path()).expect("Failed to open qcow image file"),
             false,
+            None,
             true,
             true,
             false,
@@ -1816,7 +1844,7 @@ mod tests {
     fn internal_snapshots_rejected_for_writable_open() {
         let tf = image_with_internal_snapshots(1);
         let file = tf.as_file().try_clone().unwrap();
-        let err = QcowDisk::new(file, false, false, true, false).unwrap_err();
+        let err = QcowDisk::new(file, false, None, false, true, false).unwrap_err();
         assert_eq!(err.kind(), BlockErrorKind::UnsupportedFeature, "{err}");
     }
 
@@ -1824,14 +1852,14 @@ mod tests {
     fn internal_snapshots_allowed_readonly() {
         let tf = image_with_internal_snapshots(1);
         let file = OpenOptions::new().read(true).open(tf.as_path()).unwrap();
-        QcowDisk::new(file, false, false, true, false).unwrap();
+        QcowDisk::new(file, false, None, false, true, false).unwrap();
     }
 
     #[test]
     fn no_snapshots_still_open_writable() {
         let tf = image_with_internal_snapshots(0);
         let file = tf.as_file().try_clone().unwrap();
-        QcowDisk::new(file, false, false, true, false).unwrap();
+        QcowDisk::new(file, false, None, false, true, false).unwrap();
     }
 
     #[test]
@@ -1926,7 +1954,7 @@ mod tests {
         );
 
         let file = temp.as_file().try_clone().unwrap();
-        let disk = QcowDisk::new(file, false, false, true, false).unwrap();
+        let disk = QcowDisk::new(file, false, None, false, true, false).unwrap();
 
         assert_ne!(
             read_incompat_features(&path) & IncompatFeatures::DIRTY.bits(),
@@ -1947,7 +1975,7 @@ mod tests {
     fn dirty_bit_not_used_for_v2() {
         // Test that v2 images don't use the dirty bit (no incompatible_features field)
         let temp = tempfile_with_header(&valid_header_v2());
-        let disk = QcowDisk::new(temp.into_file(), false, false, true, false).unwrap();
+        let disk = QcowDisk::new(temp.into_file(), false, None, false, true, false).unwrap();
         assert_eq!(disk.metadata().header().version, 2);
     }
 
@@ -1964,7 +1992,7 @@ mod tests {
             .unwrap();
 
         // Opening as a QcowDisk should not set the dirty bit for read-only files.
-        let _disk = QcowDisk::new(readonly_file, false, false, true, false).unwrap();
+        let _disk = QcowDisk::new(readonly_file, false, None, false, true, false).unwrap();
 
         assert_eq!(
             read_incompat_features(&temp_path) & IncompatFeatures::DIRTY.bits(),
@@ -1986,7 +2014,7 @@ mod tests {
 
         let file = temp.as_file().try_clone().unwrap();
         {
-            let _disk = QcowDisk::new(file, false, false, true, false).unwrap();
+            let _disk = QcowDisk::new(file, false, None, false, true, false).unwrap();
         }
 
         assert_eq!(
@@ -2006,7 +2034,7 @@ mod tests {
             .write(false)
             .open(&path)
             .unwrap();
-        let _disk = QcowDisk::new(readonly_file, false, false, true, false).unwrap();
+        let _disk = QcowDisk::new(readonly_file, false, None, false, true, false).unwrap();
         drop(_disk);
 
         assert_eq!(
@@ -2019,7 +2047,7 @@ mod tests {
     #[test]
     fn autoclear_features_v2_ignored() {
         let temp = tempfile_with_header(&valid_header_v2());
-        let disk = QcowDisk::new(temp.into_file(), false, false, true, false).unwrap();
+        let disk = QcowDisk::new(temp.into_file(), false, None, false, true, false).unwrap();
         let header = disk.metadata().header();
         assert_eq!(header.version, 2);
         assert_eq!(header.autoclear_features, 0);
@@ -2048,7 +2076,7 @@ mod tests {
             .open(temp.as_path())
             .unwrap();
 
-        let disk = QcowDisk::new(readonly_file, false, false, true, false)
+        let disk = QcowDisk::new(readonly_file, false, None, false, true, false)
             .expect("Corrupt image should be openable read-only");
 
         assert!(
@@ -2079,6 +2107,7 @@ mod tests {
             QcowDisk::new(
                 file.as_file().try_clone().unwrap(),
                 false,
+                None,
                 false,
                 true,
                 false,
@@ -2147,6 +2176,7 @@ mod tests {
         let _ = QcowDisk::new(
             file.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             false,
@@ -2185,7 +2215,7 @@ mod tests {
             .unwrap();
         file.set_len(16 << 20).unwrap();
 
-        let err = QcowDisk::new(file.try_clone().unwrap(), false, false, true, false)
+        let err = QcowDisk::new(file.try_clone().unwrap(), false, None, false, true, false)
             .expect_err("a file larger than the refcount table covers must be rejected");
         assert!(
             matches!(err.kind(), BlockErrorKind::CorruptImage),
@@ -2228,6 +2258,7 @@ mod tests {
             QcowDisk::new(
                 file.as_file().try_clone().unwrap(),
                 false,
+                None,
                 false,
                 true,
                 false,
@@ -2262,6 +2293,7 @@ mod tests {
         let mut disk = QcowDisk::new(
             temp.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             false,
@@ -2287,6 +2319,7 @@ mod tests {
         let mut disk = QcowDisk::new(
             temp.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             false,
@@ -2323,6 +2356,7 @@ mod tests {
         let mut disk = QcowDisk::new(
             temp.as_file().try_clone().unwrap(),
             false,
+            None,
             false,
             true,
             false,
@@ -2363,6 +2397,7 @@ mod tests {
         let mut disk = QcowDisk::new(
             overlay.as_file().try_clone().unwrap(),
             false,
+            None,
             true,
             true,
             false,
