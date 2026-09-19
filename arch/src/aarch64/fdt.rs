@@ -27,6 +27,7 @@ use vm_memory::{Address, Bytes, GuestMemoryBackend, GuestMemoryError, GuestMemor
 
 use super::super::{DeviceType, GuestMemoryMmap, InitramfsConfig};
 use super::cache::{CacheTopologyInfo, read_cache_topology};
+use super::efi::EfiHandoff;
 use super::layout::{
     GIC_V2M_COMPATIBLE, GICV2M_SPI_BASE, GICV2M_SPI_NUM, IRQ_BASE, MEM_32BIT_DEVICES_SIZE,
     MEM_32BIT_DEVICES_START, MEM_PCI_IO_SIZE, MEM_PCI_IO_START, PCI_HIGH_BASE,
@@ -70,6 +71,9 @@ const IRQ_TYPE_LEVEL_HI: u32 = 4;
 // Keys and Buttons
 // System Power Down
 const KEY_POWER: u32 = 116;
+
+// enum efi_secureboot_mode: 0 is "unset", which Ubuntu reports as a warning
+const EFI_SECUREBOOT_MODE_DISABLED: u32 = 2;
 
 /// Trait for devices to be added to the Flattened Device Tree.
 pub trait DeviceInfoForFdt {
@@ -144,6 +148,48 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     let fdt_final = fdt.finish()?;
 
     Ok(fdt_final)
+}
+
+/// The device tree for ACPI boot: a `/chosen` node and nothing else.
+///
+/// `dt_is_stub()` in the arm64 kernel treats any depth-1 node other than
+/// `chosen` as proof of a "real" DTB and turns ACPI off, so describing no
+/// hardware here is what lets the guest take its hardware from ACPI instead —
+/// and is why `acpi=force` is not needed on the command line.
+pub fn create_stub_fdt(
+    cmdline: &str,
+    initrd: &Option<InitramfsConfig>,
+    efi: &EfiHandoff,
+) -> FdtWriterResult<Vec<u8>> {
+    let mut fdt = FdtWriter::new().unwrap();
+
+    let root_node = fdt.begin_node("")?;
+    fdt.property_u32("#address-cells", ADDRESS_CELLS)?;
+    fdt.property_u32("#size-cells", SIZE_CELLS)?;
+
+    let chosen_node = fdt.begin_node("chosen")?;
+    fdt.property_string("bootargs", cmdline)?;
+    if let Some(initrd_config) = initrd {
+        let initrd_start = initrd_config.address.raw_value();
+        fdt.property_u64("linux,initrd-start", initrd_start)?;
+        fdt.property_u64("linux,initrd-end", initrd_start + initrd_config.size as u64)?;
+    }
+    fdt.property_u64("linux,uefi-system-table", efi.systab_addr)?;
+    fdt.property_u64("linux,uefi-mmap-start", efi.mmap_addr)?;
+    fdt.property_u32("linux,uefi-mmap-size", efi.mmap_size)?;
+    fdt.property_u32("linux,uefi-mmap-desc-size", efi.mmap_desc_size)?;
+    fdt.property_u32("linux,uefi-mmap-desc-ver", efi.mmap_desc_ver)?;
+    // Ubuntu's kernel makes `linux,uefi-secure-boot` a required property in
+    // efi_get_fdt_params(); without it the EFI handoff is abandoned, the memory
+    // map is never installed, and — since this tree has no /memory node —
+    // memblock comes up empty and paging_init panics with "Failed to allocate
+    // page table page". Mainline ignores the property.
+    fdt.property_u32("linux,uefi-secure-boot", EFI_SECUREBOOT_MODE_DISABLED)?;
+    fdt.end_node(chosen_node)?;
+
+    fdt.end_node(root_node)?;
+
+    fdt.finish()
 }
 
 pub fn write_fdt_to_memory(fdt_final: &[u8], guest_mem: &GuestMemoryMmap) -> Result<()> {
@@ -1064,8 +1110,94 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
 mod tests {
     use std::collections::BTreeMap;
 
+    use vm_memory::GuestAddress;
+
     use super::*;
     use crate::NumaNode;
+
+    fn test_handoff() -> EfiHandoff {
+        EfiHandoff {
+            systab_addr: 0x4010_1000,
+            mmap_addr: 0x4010_0000,
+            mmap_size: 160,
+            mmap_desc_size: 40,
+            mmap_desc_ver: 1,
+        }
+    }
+
+    // The whole ACPI mode rests on this: dt_is_stub() in the arm64 kernel
+    // reads any depth-1 node other than `chosen` as proof of a real DTB
+    // and turns ACPI back off, which would silently put us back on the device
+    // tree with no hardware described in it.
+    #[test]
+    fn stub_fdt_has_only_a_chosen_node() {
+        let blob = create_stub_fdt("console=ttyAMA0", &None, &test_handoff()).unwrap();
+        let fdt = fdt_parser::Fdt::new(&blob).unwrap();
+        let root = fdt.find_node("/").unwrap();
+        let children: Vec<&str> = root.children().map(|c| c.name).collect();
+        assert_eq!(children, vec!["chosen"]);
+    }
+
+    #[test]
+    fn stub_fdt_publishes_the_efi_handoff() {
+        let handoff = test_handoff();
+        let blob = create_stub_fdt("console=ttyAMA0 rw", &None, &handoff).unwrap();
+        let fdt = fdt_parser::Fdt::new(&blob).unwrap();
+        let chosen = fdt.find_node("/chosen").unwrap();
+
+        let u64_prop = |name: &str| -> u64 {
+            let p = chosen
+                .properties()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            BigEndian::read_u64(p.value)
+        };
+        let u32_prop = |name: &str| -> u32 {
+            let p = chosen
+                .properties()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            BigEndian::read_u32(p.value)
+        };
+
+        assert_eq!(u64_prop("linux,uefi-system-table"), handoff.systab_addr);
+        assert_eq!(u64_prop("linux,uefi-mmap-start"), handoff.mmap_addr);
+        assert_eq!(u32_prop("linux,uefi-mmap-size"), handoff.mmap_size);
+        assert_eq!(
+            u32_prop("linux,uefi-mmap-desc-size"),
+            handoff.mmap_desc_size
+        );
+        assert_eq!(u32_prop("linux,uefi-mmap-desc-ver"), handoff.mmap_desc_ver);
+
+        // Ubuntu's efi_get_fdt_params() treats this as required; dropping it
+        // aborts the handoff and panics the guest in paging_init.
+        assert_eq!(
+            u32_prop("linux,uefi-secure-boot"),
+            EFI_SECUREBOOT_MODE_DISABLED
+        );
+    }
+
+    #[test]
+    fn stub_fdt_carries_the_initramfs_when_there_is_one() {
+        let initrd = Some(InitramfsConfig {
+            address: GuestAddress(0x8000_0000),
+            size: 0x10_0000,
+        });
+        let blob = create_stub_fdt("", &initrd, &test_handoff()).unwrap();
+        let fdt = fdt_parser::Fdt::new(&blob).unwrap();
+        let chosen = fdt.find_node("/chosen").unwrap();
+        let prop = |name: &str| {
+            BigEndian::read_u64(
+                chosen
+                    .properties()
+                    .find(|p| p.name == name)
+                    .unwrap_or_else(|| panic!("{name} missing"))
+                    .value,
+            )
+        };
+        assert_eq!(prop("linux,initrd-start"), 0x8000_0000);
+        assert_eq!(prop("linux,initrd-end"), 0x8010_0000);
+    }
 
     // Helper function to create a simple NumaNode for testing
     fn create_test_numa_node(cpus: Vec<u32>, device_id: Option<String>) -> NumaNode {
