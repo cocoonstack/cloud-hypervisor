@@ -1864,7 +1864,7 @@ impl Vm {
     #[cfg(target_arch = "aarch64")]
     fn configure_system(
         &mut self,
-        _rsdp_addr: Option<GuestAddress>,
+        rsdp_addr: Option<GuestAddress>,
         _entry_addr: EntryPoint,
     ) -> Result<()> {
         let cmdline = Self::generate_cmdline(
@@ -1933,13 +1933,28 @@ impl Vm {
                 ))
             })?;
 
-        let smbios = self
-            .config
-            .lock()
-            .unwrap()
-            .platform
-            .as_ref()
-            .and_then(|p| p.smbios_config());
+        let platform = self.config.lock().unwrap().platform.clone();
+        let smbios = platform.as_ref().and_then(|p| p.smbios_config());
+
+        // Placed after the vgic and PMU setup above: init_pmu() arms
+        // KVM_ARM_VCPU_PMU_V3_INIT, without which KVM_RUN fails EINVAL on every
+        // vcpu that carries the PMU feature bit.
+        if platform.as_ref().is_none_or(|p| p.acpi_boot) {
+            // The ACPI tables are already in guest memory; all that is missing is
+            // a way for the guest to find them, so the device tree carries the EFI
+            // handoff instead of a hardware description.
+            let rsdp_addr = rsdp_addr.ok_or(Error::ConfigureSystem(
+                arch::Error::PlatformSpecific(arch::aarch64::Error::MissingRsdp),
+            ))?;
+            return arch::aarch64::configure_system_acpi(
+                &mem,
+                cmdline.as_cstring().unwrap().to_str().unwrap(),
+                &initramfs_config,
+                rsdp_addr,
+                smbios.as_ref(),
+            )
+            .map_err(Error::ConfigureSystem);
+        }
 
         arch::configure_system(
             &mem,

@@ -4,6 +4,9 @@
 
 /// Module for cache info.
 pub mod cache;
+/// Module for the synthesized EFI handoff that gives an ACPI-booted guest its
+/// RSDP without firmware.
+pub mod efi;
 /// Module for the flattened device tree.
 pub mod fdt;
 /// Layout for this aarch64 system.
@@ -56,6 +59,14 @@ pub enum Error {
     /// Error initializing PMU for vcpu
     #[error("Error initializing PMU for vcpu")]
     VcpuInitPmu,
+
+    /// Failed to write the EFI handoff structures.
+    #[error("Failed to write the EFI handoff structures")]
+    SetupEfi(#[source] efi::Error),
+
+    /// No RSDP address to hand the guest in ACPI boot mode.
+    #[error("No RSDP address to hand the guest in ACPI boot mode")]
+    MissingRsdp,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -158,6 +169,33 @@ pub fn configure_system<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     fdt::write_fdt_to_memory(&fdt_final, guest_mem).map_err(Error::WriteFdtToMemory)?;
 
     smbios::setup_smbios(guest_mem, smbios).map_err(Error::SmbiosSetup)?;
+
+    Ok(())
+}
+
+/// The ACPI counterpart of [`configure_system`]: synthesize the EFI handoff the
+/// arm64 EFI stub expects, then hand the guest a device tree that describes
+/// nothing but where to find it. Everything else — CPUs, GIC, timer, PCI — comes
+/// from the ACPI tables `create_acpi_tables()` has already written.
+pub fn configure_system_acpi(
+    guest_mem: &GuestMemoryMmap,
+    cmdline: &str,
+    initrd: &Option<super::InitramfsConfig>,
+    rsdp_addr: GuestAddress,
+    smbios: Option<&smbios::SmbiosConfig>,
+) -> super::Result<()> {
+    smbios::setup_smbios(guest_mem, smbios).map_err(Error::SmbiosSetup)?;
+
+    let handoff = efi::write_efi_tables(guest_mem, rsdp_addr)
+        .map_err(|e| super::Error::PlatformSpecific(Error::SetupEfi(e)))?;
+
+    let fdt_final = fdt::create_stub_fdt(cmdline, initrd, &handoff).map_err(|_| Error::SetupFdt)?;
+
+    if log_enabled!(Level::Debug) {
+        fdt::print_fdt(&fdt_final);
+    }
+
+    fdt::write_fdt_to_memory(&fdt_final, guest_mem).map_err(Error::WriteFdtToMemory)?;
 
     Ok(())
 }
