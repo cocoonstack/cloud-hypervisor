@@ -122,6 +122,11 @@ pub fn default_platformconfig_iommu_address_width_bits() -> u8 {
     DEFAULT_IOMMU_ADDRESS_WIDTH_BITS
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn default_platformconfig_acpi_boot() -> bool {
+    true
+}
+
 pub fn default_platformconfig_vfio_p2p_dma() -> bool {
     true
 }
@@ -166,6 +171,13 @@ pub struct PlatformConfig {
     pub iommufd_fd: Option<i32>,
     #[serde(default = "default_platformconfig_vfio_p2p_dma")]
     pub vfio_p2p_dma: bool,
+    /// Hand the guest ACPI through a synthesized EFI handoff instead of a
+    /// hardware-describing device tree. PCI hotplug is ACPI-only, so a
+    /// direct-kernel-booted aarch64 guest cannot see hot-added or ejected
+    /// devices without this. Firmware boot ignores it.
+    #[cfg(target_arch = "aarch64")]
+    #[serde(default = "default_platformconfig_acpi_boot")]
+    pub acpi_boot: bool,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

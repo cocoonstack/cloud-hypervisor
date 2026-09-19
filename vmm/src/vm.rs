@@ -1861,8 +1861,8 @@ impl Vm {
     #[cfg(target_arch = "aarch64")]
     fn configure_system(
         &mut self,
-        _rsdp_addr: Option<GuestAddress>,
-        _entry_addr: EntryPoint,
+        rsdp_addr: Option<GuestAddress>,
+        entry_addr: EntryPoint,
     ) -> Result<()> {
         let cmdline = Self::generate_cmdline(
             self.config.lock().unwrap().payload.as_ref().unwrap(),
@@ -1930,13 +1930,26 @@ impl Vm {
                 ))
             })?;
 
-        let smbios = self
-            .config
-            .lock()
-            .unwrap()
-            .platform
-            .as_ref()
-            .and_then(|p| p.smbios_config());
+        let platform = self.config.lock().unwrap().platform.clone();
+        let smbios = platform.as_ref().and_then(|p| p.smbios_config());
+
+        // firmware reads its memory and devices from the full device tree
+        let direct_boot = entry_addr.entry_addr != layout::UEFI_START;
+
+        // init_pmu() above must run on this path too, or KVM_RUN fails EINVAL
+        if direct_boot && platform.as_ref().is_none_or(|p| p.acpi_boot) {
+            let rsdp_addr = rsdp_addr.ok_or(Error::ConfigureSystem(
+                arch::Error::PlatformSpecific(arch::aarch64::Error::MissingRsdp),
+            ))?;
+            return arch::aarch64::configure_system_acpi(
+                &mem,
+                cmdline.as_cstring().unwrap().to_str().unwrap(),
+                &initramfs_config,
+                rsdp_addr,
+                smbios.as_ref(),
+            )
+            .map_err(Error::ConfigureSystem);
+        }
 
         arch::configure_system(
             &mem,
