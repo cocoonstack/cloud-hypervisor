@@ -1023,6 +1023,13 @@ components:
         vfio_p2p_dma:
           type: boolean
           default: true
+        acpi_boot:
+          type: boolean
+          default: true
+          description: >
+            AArch64 only. Give a direct-kernel-booted guest ACPI through a
+            synthesized EFI handoff instead of a hardware device tree.
+            Firmware boot ignores it.
 
     MemoryZoneConfig:
       required:

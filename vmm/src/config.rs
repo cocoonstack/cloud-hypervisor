@@ -890,6 +890,10 @@ impl PlatformConfig {
             oem_strings=<list_of_strings>,chassis_asset_tag=<dmi_chassis_asset_tag>"
                 .to_string();
 
+            if cfg!(target_arch = "aarch64") {
+                syntax.push_str(",acpi_boot=on|off");
+            }
+
             if cfg!(feature = "tdx") {
                 syntax.push_str(",tdx=on|off");
             }
@@ -958,6 +962,8 @@ impl PlatformConfig {
             .add("iommufd")
             .add("iommufd_fd")
             .add("vfio_p2p_dma");
+        #[cfg(target_arch = "aarch64")]
+        parser.add("acpi_boot");
         for field in SMBIOS_STRING_FIELDS {
             parser.add(field.key);
         }
@@ -1008,6 +1014,12 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(false))
             .0;
+        #[cfg(target_arch = "aarch64")]
+        let acpi_boot = parser
+            .convert::<Toggle>("acpi_boot")
+            .map_err(Error::ParsePlatform)?
+            .unwrap_or(Toggle(true))
+            .0;
 
         let mut platform_config = PlatformConfig {
             num_pci_segments,
@@ -1029,6 +1041,8 @@ impl PlatformConfig {
             #[cfg(feature = "sev_snp")]
             sev_snp,
             vfio_p2p_dma,
+            #[cfg(target_arch = "aarch64")]
+            acpi_boot,
         };
 
         for field in SMBIOS_STRING_FIELDS {
@@ -5879,6 +5893,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             tdx: false,
             #[cfg(feature = "sev_snp")]
             sev_snp: false,
+            #[cfg(target_arch = "aarch64")]
+            acpi_boot: default_platformconfig_acpi_boot(),
         }
     }
 
