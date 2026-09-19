@@ -122,6 +122,11 @@ pub fn default_platformconfig_iommu_address_width_bits() -> u8 {
     DEFAULT_IOMMU_ADDRESS_WIDTH_BITS
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn default_platformconfig_acpi_boot() -> bool {
+    false
+}
+
 pub fn default_platformconfig_vfio_p2p_dma() -> bool {
     true
 }
@@ -166,6 +171,10 @@ pub struct PlatformConfig {
     pub iommufd_fd: Option<i32>,
     #[serde(default = "default_platformconfig_vfio_p2p_dma")]
     pub vfio_p2p_dma: bool,
+    /// Give a direct-booted guest ACPI (needed for PCI hotplug) via a synthesized EFI handoff.
+    #[cfg(target_arch = "aarch64")]
+    #[serde(default = "default_platformconfig_acpi_boot")]
+    pub acpi_boot: bool,
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

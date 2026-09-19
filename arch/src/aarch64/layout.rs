@@ -116,6 +116,10 @@ pub const FDT_START: GuestAddress = RAM_START;
 /// documentation](https://www.kernel.org/doc/Documentation/arm64/booting.txt).
 pub const FDT_MAX_SIZE: u64 = 0x20_0000;
 
+/// EFI handoff for ACPI boot, carved from the upper half of the FDT window the stub tree barely uses.
+pub const EFI_START: GuestAddress = GuestAddress(RAM_START.0 + FDT_MAX_SIZE / 2);
+pub const EFI_MAX_SIZE: u64 = FDT_MAX_SIZE / 2;
+
 /// Put ACPI table above dtb
 pub const ACPI_START: GuestAddress = GuestAddress(RAM_START.0 + FDT_MAX_SIZE);
 const ACPI_SMBIOS_MAX_SIZE: u64 = 0x20_0000;
