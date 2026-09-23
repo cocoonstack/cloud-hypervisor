@@ -87,6 +87,17 @@ pub struct VcpuKvmState {
     pub nested_state: Option<KvmNestedStateBuffer>,
     #[serde(default)]
     pub hyperv_synic: bool,
+    // Absent from snapshots taken before it was saved, and when the guest has no
+    // shadow stacks.
+    #[serde(default)]
+    pub guest_ssp: Option<u64>,
+}
+
+/// CPUID.(EAX=7,ECX=0):ECX[7], CET shadow stack.
+pub fn cpuid_has_shstk(cpuid: &[CpuIdEntry]) -> bool {
+    cpuid
+        .iter()
+        .any(|e| e.function == 7 && e.index == 0 && e.ecx & (1 << 7) != 0)
 }
 
 impl From<SegmentRegister> for kvm_segment {
