@@ -6,12 +6,13 @@
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::mem::{MaybeUninit, zeroed};
 use std::num::NonZeroUsize;
 use std::ops::{BitAnd, Not, Sub};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -34,6 +35,7 @@ use virtio_devices::BlocksState;
 use virtio_devices::mem::Error as VirtioMemError;
 #[cfg(target_arch = "x86_64")]
 use vm_allocator::GsiApic;
+use vm_allocator::page_size::get_page_size;
 use vm_allocator::{AddressAllocator, MemorySlotAllocator, SystemAllocator};
 use vm_device::BusDevice;
 use vm_memory::bitmap::AtomicBitmap;
@@ -57,7 +59,7 @@ use crate::coredump::{
 };
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
-use crate::sparse::{next_data_extent, write_region_sparse};
+use crate::sparse::{clone_file, next_data_extent, write_region_sparse};
 use crate::uffd::{
     self, FileUffdMemorySource, SocketUffdMemorySource, UffdMemorySource, UffdRange,
 };
@@ -93,6 +95,13 @@ const MPOL_MF_MOVE: u32 = 1 << 1;
 
 // Reserve 1 MiB for platform MMIO devices (e.g. ACPI control devices)
 const PLATFORM_DEVICE_AREA_SIZE: u64 = 1 << 20;
+
+const PAGEMAP_PRESENT: u64 = 1 << 63;
+const PAGEMAP_SWAP: u64 = 1 << 62;
+const PAGEMAP_FILE: u64 = 1 << 61;
+const PAGEMAP_CHUNK_ENTRIES: u64 = 1 << 17;
+// bounds the extent count of a cloned snapshot
+const COW_SNAPSHOT_MAX_MERGED_GAP_PAGES: u64 = 8;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct HotPlugState {
@@ -201,6 +210,12 @@ struct ArchMemRegion {
     r_type: RegionType,
 }
 
+// The snapshot memory file a copy-on-write restore mapped guest RAM from.
+struct CowSource {
+    file: File,
+    ranges: MemoryRangeTable,
+}
+
 pub struct MemoryManager {
     boot_guest_memory: GuestMemoryMmap,
     guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
@@ -227,6 +242,7 @@ pub struct MemoryManager {
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    cow_source: Option<CowSource>,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -993,7 +1009,12 @@ impl MemoryManager {
                 "snapshot memory file is shorter than the saved ranges",
             )));
         }
-        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)
+        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)?;
+        self.cow_source = Some(CowSource {
+            file: memory_file,
+            ranges: saved_regions.clone(),
+        });
+        Ok(())
     }
 
     /// Restore guest memory using userfaultfd for lazy demand paging.
@@ -2074,6 +2095,7 @@ impl MemoryManager {
             reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            cow_source: None,
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
@@ -3435,7 +3457,13 @@ impl Snapshottable for MemoryManager {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        let memory_ranges = self.memory_range_table(MemoryRangePolicy::SkipPersisted)?;
+        let mut memory_ranges = self.memory_range_table(MemoryRangePolicy::SkipPersisted)?;
+        // zones iterate in per-process hash order; the source order keeps it clonable
+        if let Some(source) = &self.cow_source
+            && same_ranges(&source.ranges, &memory_ranges)
+        {
+            memory_ranges = source.ranges.clone();
+        }
 
         // Store locally this list of ranges as it will be used through the
         // Transportable::send() implementation. The point is to avoid the
@@ -3481,6 +3509,34 @@ impl Transportable for MemoryManager {
             .map(|r| r.length)
             .sum();
 
+        let guest_memory = self.guest_memory.memory();
+
+        if let Some(source) = &self.cow_source {
+            match cow_snapshot_runs(&guest_memory, source, &self.snapshot_memory_ranges)
+                .and_then(|runs| clone_file(&source.file, &memory_file).map(|()| runs))
+            {
+                Ok(runs) => {
+                    memory_file
+                        .set_len(total_len)
+                        .context("Error sizing cloned memory snapshot file")
+                        .map_err(MigratableError::MigrateSend)?;
+                    for (file_offset, gpa, length) in runs {
+                        write_guest_range(
+                            &guest_memory,
+                            &mut memory_file,
+                            file_offset,
+                            gpa,
+                            length,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    info!("Snapshot: writing all guest memory, restore source not cloned: {e}");
+                }
+            }
+        }
+
         // Pre-size the file so per-region write_at lands at the dense-layout
         // offset. On filesystems that support sparse files unwritten bytes
         // become real holes; on others the kernel zero-fills the allocation,
@@ -3490,7 +3546,6 @@ impl Transportable for MemoryManager {
         // write path which never writes past the growing EOF.
         let sparse_layout = memory_file.set_len(total_len).is_ok();
 
-        let guest_memory = self.guest_memory.memory();
         let mut file_cursor: u64 = 0;
 
         for range in self.snapshot_memory_ranges.ranges() {
@@ -3518,31 +3573,14 @@ impl Transportable for MemoryManager {
             }
 
             if !wrote_sparse {
-                // Dense fallback: anonymous mmap or hugetlbfs (no
-                // SEEK_HOLE). Match the dense layout by seeking to
-                // file_cursor and streaming bytes via the existing
-                // volatile copy.
-                memory_file
-                    .seek(SeekFrom::Start(file_cursor))
-                    .context("Error seeking memory snapshot file")
-                    .map_err(MigratableError::MigrateSend)?;
-                let mut offset: u64 = 0;
-                // Manual partial-write loop preserves the workaround for
-                // https://github.com/rust-vmm/vm-memory/issues/174
-                loop {
-                    let bytes_written = guest_memory
-                        .write_volatile_to(
-                            GuestAddress(range.gpa + offset),
-                            &mut memory_file,
-                            (range.length - offset) as usize,
-                        )
-                        .context("Error writing dense memory snapshot region")
-                        .map_err(MigratableError::MigrateSend)?;
-                    offset += bytes_written as u64;
-                    if offset == range.length {
-                        break;
-                    }
-                }
+                // dense fallback: anonymous mmap or hugetlbfs (no SEEK_HOLE)
+                write_guest_range(
+                    &guest_memory,
+                    &mut memory_file,
+                    file_cursor,
+                    range.gpa,
+                    range.length,
+                )?;
             }
 
             file_cursor += range.length;
@@ -3623,6 +3661,155 @@ impl Migratable for MemoryManager {
         }
         Ok(table)
     }
+}
+
+// Reports whether both tables hold the same ranges, in any order.
+fn same_ranges(a: &MemoryRangeTable, b: &MemoryRangeTable) -> bool {
+    let mut a = a.ranges().to_vec();
+    let mut b = b.ranges().to_vec();
+    a.sort_unstable_by_key(|r| r.gpa);
+    b.sort_unstable_by_key(|r| r.gpa);
+    a == b
+}
+
+fn write_guest_range(
+    guest_memory: &GuestMemoryMmap,
+    file: &mut File,
+    file_offset: u64,
+    gpa: u64,
+    length: u64,
+) -> result::Result<(), MigratableError> {
+    file.seek(SeekFrom::Start(file_offset))
+        .context("Error seeking memory snapshot file")
+        .map_err(MigratableError::MigrateSend)?;
+    let mut offset: u64 = 0;
+    // Manual partial-write loop preserves the workaround for
+    // https://github.com/rust-vmm/vm-memory/issues/174
+    while offset < length {
+        let bytes_written = guest_memory
+            .write_volatile_to(GuestAddress(gpa + offset), file, (length - offset) as usize)
+            .context("Error writing memory snapshot region")
+            .map_err(MigratableError::MigrateSend)?;
+        offset += bytes_written as u64;
+    }
+    Ok(())
+}
+
+// (file offset, gpa, length) runs that no longer read from the restore source
+fn cow_snapshot_runs(
+    guest_memory: &GuestMemoryMmap,
+    source: &CowSource,
+    ranges: &MemoryRangeTable,
+) -> io::Result<Vec<(u64, u64, u64)>> {
+    if source.ranges.ranges() != ranges.ranges() {
+        return Err(io::Error::other("memory layout changed since the restore"));
+    }
+    let metadata = source.file.metadata()?;
+    let maps = fs::read_to_string("/proc/self/maps")?;
+    let pagemap = File::open("/proc/self/pagemap")?;
+    let page_size = get_page_size();
+
+    let mut runs = Vec::new();
+    let mut file_offset: u64 = 0;
+    for range in ranges.ranges() {
+        let host_addr = guest_memory
+            .get_host_address(GuestAddress(range.gpa))
+            .map_err(io::Error::other)? as u64;
+        if !maps_back_window(&maps, host_addr, range.length, metadata.ino(), file_offset) {
+            return Err(io::Error::other(
+                "guest memory is no longer mapped from the restore source",
+            ));
+        }
+        for (offset, length) in changed_page_runs(
+            &pagemap,
+            host_addr,
+            range.length,
+            page_size,
+            COW_SNAPSHOT_MAX_MERGED_GAP_PAGES,
+        )? {
+            runs.push((file_offset + offset, range.gpa + offset, length));
+        }
+        file_offset += range.length;
+    }
+    Ok(runs)
+}
+
+// The maps device column is the superblock device, not `st_dev`, on btrfs and
+// overlayfs, so only the inode is compared.
+fn maps_back_window(maps: &str, start: u64, length: u64, ino: u64, file_offset: u64) -> bool {
+    let end = start + length;
+    let mut cursor = start;
+    for line in maps.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        let (Some(span), Some(_perms), Some(offset), Some(_device), Some(inode)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let Some((lo, hi)) = span.split_once('-') else {
+            continue;
+        };
+        let (Ok(lo), Ok(hi)) = (u64::from_str_radix(lo, 16), u64::from_str_radix(hi, 16)) else {
+            continue;
+        };
+        if hi <= cursor {
+            continue;
+        }
+        if lo > cursor {
+            return false;
+        }
+        let backs = u64::from_str_radix(offset, 16)
+            .is_ok_and(|o| o + (cursor - lo) == file_offset + (cursor - start))
+            && inode.parse::<u64>().is_ok_and(|i| i == ino);
+        if !backs {
+            return false;
+        }
+        cursor = hi;
+        if cursor >= end {
+            return true;
+        }
+    }
+    false
+}
+
+// private copies are present or swapped pages without the file bit
+fn changed_page_runs(
+    pagemap: &File,
+    host_addr: u64,
+    length: u64,
+    page_size: u64,
+    max_gap_pages: u64,
+) -> io::Result<Vec<(u64, u64)>> {
+    let first_page = host_addr / page_size;
+    let pages = length / page_size;
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut buf = vec![0u8; (PAGEMAP_CHUNK_ENTRIES * 8) as usize];
+    let mut page: u64 = 0;
+    while page < pages {
+        let count = (pages - page).min(PAGEMAP_CHUNK_ENTRIES);
+        let entries = &mut buf[..(count * 8) as usize];
+        pagemap.read_exact_at(entries, (first_page + page) * 8)?;
+        for (i, raw) in entries.as_chunks::<8>().0.iter().enumerate() {
+            let entry = u64::from_ne_bytes(*raw);
+            if entry & (PAGEMAP_PRESENT | PAGEMAP_SWAP) == 0 || entry & PAGEMAP_FILE != 0 {
+                continue;
+            }
+            let p = page + i as u64;
+            match runs.last_mut() {
+                Some((_, end)) if p - *end <= max_gap_pages => *end = p + 1,
+                _ => runs.push((p, p + 1)),
+            }
+        }
+        page += count;
+    }
+    Ok(runs
+        .into_iter()
+        .map(|(start, end)| (start * page_size, (end - start) * page_size))
+        .collect())
 }
 
 // Reports whether every saved range is page-aligned and lies wholly inside a
@@ -3941,6 +4128,145 @@ mod tests {
         file.seek(SeekFrom::Start(0)).unwrap();
         file.read_exact(&mut back).unwrap();
         assert_eq!(back[0], 0xab);
+    }
+
+    fn cow_restored_guest(pages: u64) -> (GuestMemoryMmap, CowSource) {
+        let page = page_size();
+        let gm =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (pages * page) as usize)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        for i in 0..pages {
+            file.write_all(&vec![i as u8 + 1; page as usize]).unwrap();
+        }
+        let mut ranges = MemoryRangeTable::default();
+        ranges.push(MemoryRange {
+            gpa: 0,
+            length: pages * page,
+        });
+        do_mmap_cow_saved_regions(&gm, &file, &ranges, false).unwrap();
+        (gm, CowSource { file, ranges })
+    }
+
+    #[test]
+    fn changed_page_runs_reports_private_copies_only() {
+        let page = page_size();
+        let (gm, _source) = cow_restored_guest(16);
+        for i in [1, 2, 5, 15] {
+            gm.write_obj::<u8>(0xee, GuestAddress(i * page)).unwrap();
+        }
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(3 * page)).unwrap(), 4);
+        let host = gm.get_host_address(GuestAddress(0)).unwrap();
+        // SAFETY: the page lies inside the private mapping installed above.
+        let ret = unsafe {
+            libc::madvise(
+                host.add((15 * page) as usize).cast(),
+                page as usize,
+                libc::MADV_DONTNEED,
+            )
+        };
+        assert_eq!(ret, 0);
+        assert_eq!(gm.read_obj::<u8>(GuestAddress(15 * page)).unwrap(), 16);
+
+        let pagemap = File::open("/proc/self/pagemap").unwrap();
+        assert_eq!(
+            changed_page_runs(&pagemap, host as u64, 16 * page, page, 0).unwrap(),
+            vec![(page, 2 * page), (5 * page, page)]
+        );
+        assert_eq!(
+            changed_page_runs(&pagemap, host as u64, 16 * page, page, 2).unwrap(),
+            vec![(page, 5 * page)]
+        );
+    }
+
+    #[test]
+    fn same_ranges_ignores_order_only() {
+        let range = |gpa, length| MemoryRange { gpa, length };
+        let mut a = MemoryRangeTable::default();
+        a.push(range(0x1000_0000, 0x1000));
+        a.push(range(0, 0x2000));
+        let mut b = MemoryRangeTable::default();
+        b.push(range(0, 0x2000));
+        b.push(range(0x1000_0000, 0x1000));
+        assert!(same_ranges(&a, &b));
+        b.push(range(0x2000_0000, 0x1000));
+        assert!(!same_ranges(&a, &b));
+    }
+
+    #[test]
+    fn maps_back_window_requires_contiguous_mappings_of_the_file() {
+        let maps = "\
+7f0000000000-7f0000002000 rw-p 00004000 fd:01 42 /snap/memory-ranges
+7f0000002000-7f0000003000 rw-p 00006000 fd:01 42 /snap/memory-ranges
+7f0000003000-7f0000004000 rw-p 00000000 00:00 0
+";
+        assert!(maps_back_window(maps, 0x7f00_0000_0000, 0x3000, 42, 0x4000));
+        assert!(maps_back_window(maps, 0x7f00_0000_1000, 0x1000, 42, 0x5000));
+        assert!(!maps_back_window(maps, 0x7f00_0000_0000, 0x3000, 42, 0));
+        assert!(!maps_back_window(
+            maps,
+            0x7f00_0000_0000,
+            0x3000,
+            43,
+            0x4000
+        ));
+        assert!(!maps_back_window(
+            maps,
+            0x7f00_0000_0000,
+            0x4000,
+            42,
+            0x4000
+        ));
+        assert!(!maps_back_window(
+            maps,
+            0x7eff_ffff_f000,
+            0x2000,
+            42,
+            0x3000
+        ));
+    }
+
+    #[test]
+    fn cow_snapshot_matches_a_full_dump() {
+        let page = page_size();
+        let (gm, source) = cow_restored_guest(16);
+        gm.write_obj::<u8>(0x77, GuestAddress(12 * page + 9))
+            .unwrap();
+        gm.write_obj::<u8>(0x55, GuestAddress(page)).unwrap();
+
+        let runs = cow_snapshot_runs(&gm, &source, &source.ranges).unwrap();
+        assert_eq!(runs, vec![(page, page, page), (12 * page, 12 * page, page)]);
+
+        let mut other = MemoryRangeTable::default();
+        other.push(MemoryRange {
+            gpa: 0,
+            length: 4 * page,
+        });
+        cow_snapshot_runs(&gm, &source, &other).unwrap_err();
+
+        let mut snapshot = tempfile::tempfile().unwrap();
+        match clone_file(&source.file, &snapshot) {
+            Ok(()) => {
+                snapshot.set_len(16 * page).unwrap();
+                for (file_offset, gpa, length) in runs {
+                    write_guest_range(&gm, &mut snapshot, file_offset, gpa, length).unwrap();
+                }
+            }
+            Err(e) => {
+                assert!(
+                    matches!(
+                        e.raw_os_error(),
+                        Some(libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL)
+                    ),
+                    "unexpected clone error: {e}"
+                );
+                write_guest_range(&gm, &mut snapshot, 0, 0, 16 * page).unwrap();
+            }
+        }
+        let mut got = vec![0u8; (16 * page) as usize];
+        snapshot.read_exact_at(&mut got, 0).unwrap();
+        let mut want = vec![0u8; (16 * page) as usize];
+        gm.read_slice(&mut want, GuestAddress(0)).unwrap();
+        assert!(got == want);
     }
 
     #[test]
