@@ -832,23 +832,43 @@ impl AddressManager {
             .map_err(io::Error::other)
     }
 
-    fn update_device(
+    /// Device-side release of a BAR at `base`: the virtio follow-on mappings,
+    /// then the device's own prepare.
+    fn move_bar_prepare_device(
         &self,
         pci_dev: &mut dyn PciDevice,
         bar_idx: usize,
-        old_base: u64,
-        new_base: u64,
+        base: u64,
     ) -> result::Result<(), io::Error> {
         let any_dev = pci_dev.as_any_mut();
         if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>()
             && bar_idx == VIRTIO_CONFIG_BAR_INDEX
         {
-            for (event, addr) in virtio_pci_dev.ioeventfds(old_base) {
+            for (event, addr) in virtio_pci_dev.ioeventfds(base) {
                 let io_addr = IoEventAddress::Mmio(addr);
                 self.vm.unregister_ioevent(event, &io_addr).map_err(|e| {
                     io::Error::other(format!("failed to unregister ioevent: {e:?}"))
                 })?;
             }
+        }
+
+        pci_dev.move_bar_prepare(bar_idx)
+    }
+
+    /// Device-side install of a BAR at `new_base`: the device's own commit,
+    /// then the virtio follow-on mappings.
+    fn move_bar_commit_device(
+        &self,
+        pci_dev: &mut dyn PciDevice,
+        bar_idx: usize,
+        new_base: u64,
+    ) -> result::Result<(), io::Error> {
+        pci_dev.move_bar_commit(bar_idx, new_base)?;
+
+        let any_dev = pci_dev.as_any_mut();
+        if let Some(virtio_pci_dev) = any_dev.downcast_ref::<VirtioPciDevice>()
+            && bar_idx == VIRTIO_CONFIG_BAR_INDEX
+        {
             for (event, addr) in virtio_pci_dev.ioeventfds(new_base) {
                 let io_addr = IoEventAddress::Mmio(addr);
                 self.vm
@@ -857,8 +877,7 @@ impl AddressManager {
             }
         }
 
-        pci_dev.move_bar_prepare(bar_idx)?;
-        pci_dev.move_bar_commit(bar_idx, new_base)
+        Ok(())
     }
 }
 
@@ -899,7 +918,8 @@ impl DeviceRelocation for AddressManager {
             }
         }
 
-        self.update_device(pci_dev, bar_idx, old_base, new_base)?;
+        self.move_bar_prepare_device(pci_dev, bar_idx, old_base)?;
+        self.move_bar_commit_device(pci_dev, bar_idx, new_base)?;
 
         self.update_device_tree(pci_dev, bar_idx, new_base)
     }
