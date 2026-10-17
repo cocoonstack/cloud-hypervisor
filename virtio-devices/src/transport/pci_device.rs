@@ -1208,7 +1208,7 @@ impl PciDevice for VirtioPciDevice {
         Ok(())
     }
 
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> io::Result<()> {
         if bar_idx == VIRTIO_SHM_BAR_INDEX
             && let Some(shm_list) = self.device.lock().unwrap().get_shm_regions()
         {
@@ -1216,8 +1216,22 @@ impl PciDevice for VirtioPciDevice {
                 .mapping
                 .lock()
                 .unwrap()
+                .unregister()
+                .map_err(io::Error::other)?;
+        }
+
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
+        if bar_idx == VIRTIO_SHM_BAR_INDEX
+            && let Some(shm_list) = self.device.lock().unwrap().get_shm_regions()
+        {
+            let mut mapping = shm_list.mapping.lock().unwrap();
+            mapping
                 .move_guest_address(GuestAddress(new_base))
                 .map_err(io::Error::other)?;
+            mapping.register().map_err(io::Error::other)?;
         }
 
         for bar in self.bar_regions.iter_mut() {
