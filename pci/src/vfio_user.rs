@@ -380,10 +380,17 @@ impl PciDevice for VfioUserPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
-        info!("Moving BAR {bar_idx} -> 0x{new_base:x}");
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> Result<(), io::Error> {
+        info!("Unmapping BAR {bar_idx}");
         self.common
-            .move_bar(bar_idx, new_base)
+            .move_bar_prepare(bar_idx)
+            .map_err(io::Error::other)
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        info!("Mapping BAR {bar_idx} -> 0x{new_base:x}");
+        self.common
+            .move_bar_commit(bar_idx, new_base)
             .map_err(io::Error::other)
     }
 
