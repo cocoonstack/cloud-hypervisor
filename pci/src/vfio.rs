@@ -2771,13 +2771,31 @@ impl PciDevice for VfioPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> Result<(), io::Error> {
         for region in &mut self.common.mmio_regions {
-            if region.index as usize != bar_idx || region.start == GuestAddress(new_base) {
+            if region.index as usize != bar_idx {
                 continue;
             }
-            let old_base = region.start.raw_value();
-            let moves = region
+            for user_memory_region in &mut region.user_memory_regions {
+                user_memory_region.unmap_p2p(self.vfio_ops.as_ref())?;
+                user_memory_region
+                    .mapping
+                    .lock()
+                    .unwrap()
+                    .unregister()
+                    .map_err(io::Error::other)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        for region in &mut self.common.mmio_regions {
+            if region.index as usize != bar_idx {
+                continue;
+            }
+            let map_p2p = self.p2p_dma && region.is_p2p_mappable();
+            let new_addresses = region
                 .user_memory_regions
                 .iter()
                 .map(|user_memory_region| {
@@ -2787,82 +2805,37 @@ impl PciDevice for VfioPciDevice {
                     new_address
                         .checked_add(user_memory_region.size() as u64)
                         .ok_or_else(|| io::Error::other("BAR range overflows"))?;
-                    Ok((
-                        user_memory_region.start(),
-                        new_address,
-                        user_memory_region.p2p_mapped,
-                    ))
+                    Ok(new_address)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            for (i, &(old_address, new_address, map_p2p)) in moves.iter().enumerate() {
-                let user_memory_region = &mut region.user_memory_regions[i];
-                let result = (|| {
-                    user_memory_region.unmap_p2p(self.vfio_ops.as_ref())?;
-                    user_memory_region.move_region(new_address)?;
-                    if map_p2p {
-                        user_memory_region
-                            .map_for_p2p(
-                                &self.device,
-                                &self.vfio_ops,
-                                &self.device_path,
-                                self.bdf,
-                                region.index,
-                                old_address - old_base,
-                            )
-                            .map_err(io::Error::other)?;
-                    }
-                    Ok(())
-                })();
-                if let Err(e) = result {
-                    for (user_memory_region, &(old_address, _, was_mapped)) in region
-                        .user_memory_regions[..=i]
-                        .iter_mut()
-                        .zip(&moves[..=i])
-                        .rev()
-                    {
-                        if user_memory_region.start() == old_address
-                            && user_memory_region.p2p_mapped == was_mapped
-                            && user_memory_region.mapping.lock().unwrap().is_registered()
-                        {
-                            continue;
-                        }
-                        let rollback: io::Result<()> = (|| {
-                            user_memory_region.unmap_p2p(self.vfio_ops.as_ref())?;
-                            user_memory_region.move_region(old_address)?;
-                            {
-                                let mapping = user_memory_region.mapping.lock().unwrap();
-                                if !mapping.is_registered() {
-                                    mapping.register().map_err(io::Error::other)?;
-                                }
-                            }
-                            if was_mapped {
-                                user_memory_region
-                                    .map_for_p2p(
-                                        &self.device,
-                                        &self.vfio_ops,
-                                        &self.device_path,
-                                        self.bdf,
-                                        region.index,
-                                        old_address - old_base,
-                                    )
-                                    .map_err(io::Error::other)?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(rollback) = rollback {
-                            // Continuing would leave the BAR with inconsistent mappings.
-                            error!("FATAL: Failed to restore BAR mapping: {rollback}");
-                            process::exit(1);
-                        }
-                    }
-                    return Err(e);
+            for (user_memory_region, new_address) in
+                region.user_memory_regions.iter_mut().zip(new_addresses)
+            {
+                user_memory_region.move_region(new_address)?;
+                user_memory_region
+                    .mapping
+                    .lock()
+                    .unwrap()
+                    .register()
+                    .map_err(io::Error::other)?;
+                if map_p2p {
+                    let offset = user_memory_region.offset;
+                    user_memory_region
+                        .map_for_p2p(
+                            &self.device,
+                            &self.vfio_ops,
+                            &self.device_path,
+                            self.bdf,
+                            region.index,
+                            offset,
+                        )
+                        .map_err(io::Error::other)?;
                 }
             }
             region.start = GuestAddress(new_base);
         }
         Ok(())
     }
-
     fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
         self.common.configuration.restore_bar_addr(params);
     }

@@ -915,7 +915,8 @@ impl DeviceRelocation for AddressManager {
             }
         }
 
-        pci_dev.move_bar(bar_idx, new_base)?;
+        pci_dev.move_bar_prepare(bar_idx)?;
+        pci_dev.move_bar_commit(bar_idx, new_base)?;
 
         // Update the device_tree resources associated with the device
         self.update_bar_base(pci_dev, bar_idx, new_base)

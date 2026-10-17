@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::os::unix::prelude::AsRawFd;
 use std::sync::{Arc, Barrier, Mutex};
-use std::{io, process, result};
+use std::{io, result};
 
 use log::{error, info};
 use thiserror::Error;
@@ -406,8 +406,26 @@ impl PciDevice for VfioUserPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
-        info!("Moving BAR {bar_idx} -> 0x{new_base:x}");
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> Result<(), io::Error> {
+        info!("Unmapping BAR {bar_idx}");
+        for mmio_region in &mut self.common.mmio_regions {
+            if mmio_region.index as usize != bar_idx {
+                continue;
+            }
+            for user_memory_region in &mut mmio_region.user_memory_regions {
+                user_memory_region
+                    .mapping
+                    .lock()
+                    .unwrap()
+                    .unregister()
+                    .map_err(io::Error::other)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        info!("Mapping BAR {bar_idx} -> 0x{new_base:x}");
         for mmio_region in &mut self.common.mmio_regions {
             if mmio_region.index as usize != bar_idx {
                 continue;
@@ -423,42 +441,27 @@ impl PciDevice for VfioUserPciDevice {
                     new_address
                         .checked_add(user_memory_region.size() as u64)
                         .ok_or_else(|| io::Error::other("BAR range overflows"))?;
-                    Ok((user_memory_region.start(), new_address))
+                    Ok(new_address)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            for (i, &(_, new_address)) in new_addresses.iter().enumerate() {
-                let user_memory_region = &mut mmio_region.user_memory_regions[i];
-                let result = user_memory_region.move_region(new_address);
-                if let Err(e) = result {
-                    for (user_memory_region, &(old_address, _)) in mmio_region.user_memory_regions
-                        [..=i]
-                        .iter_mut()
-                        .zip(&new_addresses[..=i])
-                        .rev()
-                    {
-                        let rollback = user_memory_region.move_region(old_address).and_then(|()| {
-                            let mapping = user_memory_region.mapping.lock().unwrap();
-                            if mapping.is_registered() {
-                                Ok(())
-                            } else {
-                                mapping.register().map_err(io::Error::other)
-                            }
-                        });
-                        if let Err(rollback) = rollback {
-                            // Continuing would leave the BAR with inconsistent mappings.
-                            error!("FATAL: Failed to restore BAR mapping: {rollback}");
-                            process::exit(1);
-                        }
-                    }
-                    return Err(e);
-                }
+            for (user_memory_region, new_address) in mmio_region
+                .user_memory_regions
+                .iter_mut()
+                .zip(new_addresses)
+            {
+                user_memory_region.move_region(new_address)?;
+                user_memory_region
+                    .mapping
+                    .lock()
+                    .unwrap()
+                    .register()
+                    .map_err(io::Error::other)?;
             }
             mmio_region.start = GuestAddress(new_base);
             info!("Moved bar 0x{old_base:x} -> 0x{new_base:x}");
         }
         Ok(())
     }
-
     fn id(&self) -> Option<String> {
         Some(self.id.clone())
     }
