@@ -3002,10 +3002,6 @@ impl PciDevice for VfioPciDevice {
             .map_err(io::Error::other)
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.common.configuration.restore_bar_addr(params);
-    }
-
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
