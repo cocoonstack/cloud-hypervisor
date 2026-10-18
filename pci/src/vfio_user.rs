@@ -27,7 +27,7 @@ use crate::vfio::{
     UserMemoryRegion, VFIO_COMMON_ID, Vfio, VfioCommon, VfioCommonConfig, VfioError, find_alignment,
 };
 use crate::{
-    BarReprogrammingParams, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError, PciSubclass,
+    BarRelocation, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError, PciSubclass,
     VfioPciError,
 };
 
@@ -386,7 +386,7 @@ impl PciDevice for VfioUserPciDevice {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         self.common.write_config_register(reg_idx, offset, data)
     }
 
