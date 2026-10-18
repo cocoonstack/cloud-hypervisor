@@ -27,8 +27,8 @@ use crate::vfio::{
     UserMemoryRegion, VFIO_COMMON_ID, Vfio, VfioCommon, VfioCommonConfig, VfioError, find_alignment,
 };
 use crate::{
-    BarRelocation, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError, PciSubclass,
-    VfioPciError,
+    BarRelocation, InstallParams, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError,
+    PciSubclass, VfioPciError,
 };
 
 pub struct VfioUserPciDevice {
@@ -496,6 +496,10 @@ impl PciDevice for VfioUserPciDevice {
 
     fn on_bar_installed(&mut self, bar_idx: usize) {
         self.common.configuration.on_bar_installed(bar_idx);
+    }
+
+    fn pending_bar_installs(&self) -> Vec<InstallParams> {
+        self.common.configuration.pending_bar_installs()
     }
 
     fn id(&self) -> Option<String> {
