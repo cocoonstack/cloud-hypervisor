@@ -65,9 +65,9 @@ use crate::configuration::{
 use crate::msi::{Error as MsiError, MSI_CONFIG_ID, MsiConfigState};
 use crate::msix::{Error as MsixError, MaybeMutInterruptSourceGroup, MsixConfigState};
 use crate::{
-    BarReprogrammingParams, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig, MsixCap,
-    MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
-    PciBdf, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
+    BarRelocation, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig, MsixCap, MsixConfig,
+    PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciBdf,
+    PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
     PciExpressCapability, PciExpressCapabilityId, PciHeaderType, PciSubclass,
     msi_num_enabled_vectors,
 };
@@ -1951,7 +1951,7 @@ impl VfioCommon {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         // When the guest wants to write to a BAR, we trap it into
         // our local configuration space. We're not reprogramming
         // VFIO device.
@@ -1973,7 +1973,7 @@ impl VfioCommon {
                 let device_writes = patch.write(offset, data);
 
                 if patch.mask == 0xffff_ffff {
-                    return (Vec::new(), None);
+                    return (BarRelocation::default(), None);
                 }
 
                 device_writes
@@ -2038,7 +2038,10 @@ impl VfioCommon {
             _ => {}
         }
 
-        (self.configuration.drain_pending_bar_reprogram(), None)
+        let mut reloc = BarRelocation::default();
+        self.configuration.drain_pending_relocation(&mut reloc);
+
+        (reloc, None)
     }
 
     pub(crate) fn read_config_register(&mut self, reg_idx: usize) -> u32 {
@@ -2964,7 +2967,7 @@ impl PciDevice for VfioPciDevice {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         #[cfg(feature = "kvm")]
         let memory_space_enabled = reg_idx == COMMAND_REG && self.is_memory_space_enabled();
 
