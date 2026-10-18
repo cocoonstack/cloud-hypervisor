@@ -257,11 +257,8 @@ impl PciBus {
             if let Err(e) = self.device_reloc.move_bar(
                 bar.bar_idx
                     .expect("bar_idx is set on detection and on restore"),
-                bar.old_base,
                 bar.new_base,
-                bar.len,
                 device,
-                bar.region_type,
             ) {
                 // Rollback the changes from detect_bar_reprogramming().
                 warn!(
@@ -552,7 +549,6 @@ mod tests {
     use std::result::Result;
 
     use super::*;
-    use crate::configuration::PciBarRegionType;
 
     #[derive(Debug)]
     /// Helper struct that mocks the implementation of DeviceRelocation
@@ -562,11 +558,8 @@ mod tests {
         fn move_bar(
             &self,
             _bar_idx: usize,
-            _old_base: u64,
             _new_base: u64,
-            _len: u64,
             _pci_dev: &mut dyn PciDevice,
-            _region_type: PciBarRegionType,
         ) -> Result<(), io::Error> {
             Ok(())
         }
