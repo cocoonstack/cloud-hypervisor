@@ -780,56 +780,77 @@ impl AddressManager {
         Ok(())
     }
 
-    fn update_io_range(
+    fn allocator_free(
         &self,
-        allocator: &mut SystemAllocator,
-        old_base: u64,
-        new_base: u64,
+        segment: usize,
+        base: u64,
         len: u64,
+        region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error> {
-        if allocator
-            .move_io_addresses(
-                GuestAddress(old_base),
-                GuestAddress(new_base),
-                len as GuestUsize,
-                Some(len.max(4)),
-            )
-            .is_none()
-        {
-            return Err(io::Error::other(format!(
-                "Cannot move IO BAR address range from {old_base:#x} to {new_base:#x}"
-            )));
+        match region_type {
+            PciBarRegionType::IoRegion => {
+                self.allocator
+                    .lock()
+                    .unwrap()
+                    .free_io_addresses(GuestAddress(base), len as GuestUsize);
+            }
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                let allocators = if region_type == PciBarRegionType::Memory32BitRegion {
+                    &self.pci_mmio32_allocators
+                } else {
+                    &self.pci_mmio64_allocators
+                };
+                allocators[segment]
+                    .lock()
+                    .unwrap()
+                    .free(GuestAddress(base), len as GuestUsize);
+            }
         }
 
-        self.io_bus
-            .update_range(old_base, len, new_base, len)
-            .map_err(io::Error::other)
+        Ok(())
     }
 
-    fn update_mmio_range(
+    fn allocator_allocate(
         &self,
-        allocator: &mut AddressAllocator,
-        old_base: u64,
-        new_base: u64,
+        segment: usize,
+        base: u64,
         len: u64,
+        region_type: PciBarRegionType,
     ) -> result::Result<(), io::Error> {
-        if allocator
-            .move_range(
-                GuestAddress(old_base),
-                GuestAddress(new_base),
-                len as GuestUsize,
-                Some(len),
-            )
-            .is_none()
-        {
-            return Err(io::Error::other(format!(
-                "Cannot move MMIO BAR address range from {old_base:#x} to {new_base:#x}"
-            )));
+        match region_type {
+            PciBarRegionType::IoRegion => {
+                self.allocator
+                    .lock()
+                    .unwrap()
+                    .allocate_io_addresses(
+                        Some(GuestAddress(base)),
+                        len as GuestUsize,
+                        Some(len.max(4)),
+                    )
+                    .ok_or_else(|| {
+                        io::Error::other(format!("failed allocating new IO range: 0x{base:x}"))
+                    })?;
+            }
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                let allocators = if region_type == PciBarRegionType::Memory32BitRegion {
+                    &self.pci_mmio32_allocators
+                } else {
+                    &self.pci_mmio64_allocators
+                };
+                // A range outside this segment's window is rejected.
+                allocators[segment]
+                    .lock()
+                    .unwrap()
+                    .allocate(Some(GuestAddress(base)), len as GuestUsize, Some(len))
+                    .ok_or_else(|| {
+                        io::Error::other(format!(
+                            "failed allocating new MMIO range: 0x{base:x}(0x{len:x})"
+                        ))
+                    })?;
+            }
         }
 
-        self.mmio_bus
-            .update_range(old_base, len, new_base, len)
-            .map_err(io::Error::other)
+        Ok(())
     }
 
     /// Device-side release of a BAR at `base`: the virtio follow-on mappings,
@@ -894,29 +915,22 @@ impl DeviceRelocation for AddressManager {
             region_type,
         } = self.bar_resource(pci_dev, bar_idx)?;
 
-        // Keep the allocator locked until the BAR has fully moved, so a
-        // concurrent allocation (e.g. a hotplug) cannot get the old range
-        // while the device still uses it.
-        let mut sys_allocator;
-        let mut pci_mmio_allocator;
-
-        match region_type {
-            PciBarRegionType::IoRegion => {
-                sys_allocator = self.allocator.lock().unwrap();
-                self.update_io_range(&mut sys_allocator, old_base, new_base, len)?;
-            }
-            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
-                let pci_mmio_allocators = if region_type == PciBarRegionType::Memory32BitRegion {
-                    &self.pci_mmio32_allocators
-                } else {
-                    &self.pci_mmio64_allocators
-                };
-                pci_mmio_allocator = pci_mmio_allocators[usize::from(pci_dev.bdf().segment())]
-                    .lock()
-                    .unwrap();
-                self.update_mmio_range(&mut pci_mmio_allocator, old_base, new_base, len)?;
-            }
+        let segment = usize::from(pci_dev.bdf().segment());
+        self.allocator_free(segment, old_base, len, region_type)?;
+        if let Err(e) = self.allocator_allocate(segment, new_base, len, region_type) {
+            // Keep the BAR at its old address.
+            self.allocator_allocate(segment, old_base, len, region_type)?;
+            return Err(e);
         }
+
+        let bus = match region_type {
+            PciBarRegionType::IoRegion => &self.io_bus,
+            PciBarRegionType::Memory32BitRegion | PciBarRegionType::Memory64BitRegion => {
+                &self.mmio_bus
+            }
+        };
+        bus.update_range(old_base, len, new_base, len)
+            .map_err(io::Error::other)?;
 
         self.move_bar_prepare_device(pci_dev, bar_idx, old_base)?;
         self.move_bar_commit_device(pci_dev, bar_idx, new_base)?;
