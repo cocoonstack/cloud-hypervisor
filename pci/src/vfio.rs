@@ -1339,6 +1339,9 @@ impl VfioCommon {
         mmio64_allocator: &mut AddressAllocator,
     ) -> Result<(), PciDeviceError> {
         for region in self.bars.iter() {
+            if self.configuration.is_bar_released(region.index as usize) {
+                continue;
+            }
             match region.type_ {
                 PciBarRegionType::IoRegion => {
                     allocator.free_io_addresses(region.start, region.length);
@@ -3121,6 +3124,14 @@ impl PciDevice for VfioPciDevice {
         self.common
             .move_bar_commit(bar_idx, new_base)
             .map_err(io::Error::other)
+    }
+
+    fn is_bar_released(&self, bar_idx: usize) -> bool {
+        self.common.configuration.is_bar_released(bar_idx)
+    }
+
+    fn on_bar_installed(&mut self, bar_idx: usize) {
+        self.common.configuration.on_bar_installed(bar_idx);
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
