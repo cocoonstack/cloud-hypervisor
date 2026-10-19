@@ -25,8 +25,9 @@ pub use self::bus::{
     PciConfigIoState, PciConfigMmio, PciRoot, PciRootError,
 };
 pub use self::configuration::{
-    PCI_CONFIGURATION_ID, PasidCap, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
-    PciCapability, PciCapabilityId, PciClassCode, PciConfiguration, PciExpressCapability,
+    COMMAND_REG, COMMAND_REG_IO_SPACE_MASK, COMMAND_REG_MEMORY_SPACE_MASK, PCI_CONFIGURATION_ID,
+    PasidCap, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability,
+    PciCapabilityId, PciClassCode, PciConfiguration, PciConfigurationState, PciExpressCapability,
     PciExpressCapabilityId, PciHeaderType, PciMassStorageSubclass, PciNetworkControllerSubclass,
     PciProgrammingInterface, PciSerialBusSubClass, PciSubclass,
 };
