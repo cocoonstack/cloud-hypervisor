@@ -2920,6 +2920,16 @@ impl Snapshottable for VfioPciDevice {
 impl Transportable for VfioPciDevice {}
 
 impl Migratable for VfioPciDevice {
+    fn check_diff_snapshot(&self) -> result::Result<(), MigratableError> {
+        if self.iommu_attached {
+            return Err(MigratableError::Snapshot(anyhow!(
+                "VFIO device {} behind a virtual IOMMU does not support dirty tracking",
+                self.id
+            )));
+        }
+        Ok(())
+    }
+
     fn notify_started_migration(&mut self) -> result::Result<(), MigratableError> {
         // Reject a device that does not implement migration v2 up front,
         // rather than silently skipping its state and dirty tracking.

@@ -9,6 +9,7 @@ use std::os::unix::prelude::AsRawFd;
 use std::sync::{Arc, Barrier, Mutex};
 use std::{io, result};
 
+use anyhow::anyhow;
 use hypervisor::HypervisorVmError;
 use log::{error, info};
 use thiserror::Error;
@@ -538,7 +539,14 @@ impl Snapshottable for VfioUserPciDevice {
     }
 }
 impl Transportable for VfioUserPciDevice {}
-impl Migratable for VfioUserPciDevice {}
+impl Migratable for VfioUserPciDevice {
+    fn check_diff_snapshot(&self) -> result::Result<(), MigratableError> {
+        Err(MigratableError::Snapshot(anyhow!(
+            "vfio-user device {} does not track dirty pages",
+            self.id
+        )))
+    }
+}
 
 pub struct VfioUserDmaMapping<M: GuestAddressSpace> {
     client: Arc<Mutex<Client>>,
