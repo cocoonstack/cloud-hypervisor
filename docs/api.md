@@ -92,6 +92,7 @@ The Cloud Hypervisor API exposes the following actions through its endpoints:
 | Delete the VM                           | `/vm.delete`                 | N/A                               | N/A                             | N/A                                                      |
 | Dump the VM information                 | `/vm.info`                   | N/A                               | `/schemas/VmInfo`               | The VM is created                                        |
 | Inject an NMI                           | `/vm.nmi`                    | N/A                               | N/A                             | The VM is booted                                         |
+| End the diff snapshot series            | `/vm.end-snapshot-series`    | N/A                               | N/A                             | Any                                                      |
 | Pause the VM                            | `/vm.pause`                  | N/A                               | N/A                             | The VM is booted                                         |
 | Trigger power button of the VM          | `/vm.power-button`           | N/A                               | N/A                             | The VM is booted                                         |
 | Reboot the VM                           | `/vm.reboot`                 | N/A                               | N/A                             | The VM is booted                                         |

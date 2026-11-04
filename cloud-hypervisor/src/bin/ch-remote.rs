@@ -111,6 +111,7 @@ trait DBusApi1 {
     fn vm_create(&self, vm_config: &str) -> zbus::Result<()>;
     fn vm_delete(&self) -> zbus::Result<()>;
     fn vm_info(&self) -> zbus::Result<String>;
+    fn vm_end_snapshot_series(&self) -> zbus::Result<()>;
     fn vm_pause(&self) -> zbus::Result<()>;
     fn vm_power_button(&self) -> zbus::Result<()>;
     fn vm_reboot(&self) -> zbus::Result<()>;
@@ -230,6 +231,10 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
             .map_err(Error::DBusApiClient)
     }
 
+    fn api_vm_end_snapshot_series(&self) -> ApiResult {
+        self.vm_end_snapshot_series().map_err(Error::DBusApiClient)
+    }
+
     fn api_vm_pause(&self) -> ApiResult {
         self.vm_pause().map_err(Error::DBusApiClient)
     }
@@ -343,6 +348,10 @@ fn rest_api_do_command(
         }
         Some("reboot") => {
             simple_api_command(socket, "PUT", "reboot", None).map_err(Error::HttpApiClient)
+        }
+        Some("end-snapshot-series") => {
+            simple_api_command(socket, "PUT", "end-snapshot-series", None)
+                .map_err(Error::HttpApiClient)
         }
         Some("pause") => {
             simple_api_command(socket, "PUT", "pause", None).map_err(Error::HttpApiClient)
@@ -603,6 +612,7 @@ fn dbus_api_do_command(
         Some("resume") => proxy.api_vm_resume(),
         Some("power-button") => proxy.api_vm_power_button(),
         Some("reboot") => proxy.api_vm_reboot(),
+        Some("end-snapshot-series") => proxy.api_vm_end_snapshot_series(),
         Some("pause") => proxy.api_vm_pause(),
         Some("info") => proxy.api_vm_info(),
         Some("balloon-stats") => proxy.api_vm_balloon_stats(),
@@ -1099,6 +1109,7 @@ fn get_cli_commands_sorted() -> Box<[Command]> {
             .about("Create VM from a JSON configuration")
             .arg(Arg::new("path").index(1).default_value("-")),
         Command::new("delete").about("Delete a VM"),
+        Command::new("end-snapshot-series").about("End the active diff snapshot series"),
         Command::new("info").about("Info on the VM"),
         Command::new("nmi").about("Trigger NMI"),
         Command::new("pause").about("Pause the VM"),

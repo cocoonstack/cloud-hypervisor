@@ -126,6 +126,16 @@ paths:
         409:
           description: The operation conflicts with the current state of the VM.
 
+  /vm.end-snapshot-series:
+    put:
+      summary: End the active diff snapshot series and stop dirty page tracking.
+      operationId: vmEndSnapshotSeries
+      responses:
+        204:
+          description: No series is active any more. This also holds when none was active.
+        500:
+          description: Dirty page tracking could not stop. The series is over regardless.
+
   /vm.resume:
     put:
       summary: Resume a previously paused VM instance.
