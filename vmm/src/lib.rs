@@ -2642,6 +2642,12 @@ impl RequestHandler for Vmm {
                 // the first diff of a series is a full baseline
                 let effective_diff = requested_diff && self.snapshot_series.is_some();
                 if requested_diff {
+                    if let Err(e) = vm.check_diff_snapshot() {
+                        if self.snapshot_series.take().is_some() {
+                            let _ = vm.stop_dirty_log();
+                        }
+                        return Err(VmError::Snapshot(e));
+                    }
                     let layout = vm
                         .memory_range_table(MemoryRangePolicy::SkipPersisted)
                         .map_err(VmError::Snapshot)?;
@@ -3134,6 +3140,9 @@ impl RequestHandler for Vmm {
                 let info = vm.add_device(device_cfg).inspect_err(|e| {
                     error!("Error when adding new device to the VM: {e:?}");
                 })?;
+                if self.snapshot_series.take().is_some() {
+                    let _ = vm.stop_dirty_log();
+                }
                 serde_json::to_vec(&info)
                     .map(Some)
                     .map_err(VmError::SerializeJson)
@@ -3185,6 +3194,9 @@ impl RequestHandler for Vmm {
             VmOwnership::Owned(ref mut vm) => {
                 vm.remove_device(&id)
                     .inspect_err(|e| error!("Error when removing device from the VM: {e:?}"))?;
+                if self.snapshot_series.take().is_some() {
+                    let _ = vm.stop_dirty_log();
+                }
                 Ok(())
             }
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
