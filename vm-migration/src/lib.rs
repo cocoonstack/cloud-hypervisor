@@ -302,6 +302,10 @@ pub trait Migratable: Send + Pausable + Snapshottable + Transportable {
         Ok(MemoryRangeTable::default())
     }
 
+    fn check_diff_snapshot(&self) -> result::Result<(), MigratableError> {
+        Ok(())
+    }
+
     fn notify_started_migration(&mut self) -> result::Result<(), MigratableError> {
         Ok(())
     }
