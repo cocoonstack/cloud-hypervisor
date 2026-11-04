@@ -109,6 +109,7 @@ trait DBusApi1 {
     fn vm_create(&self, vm_config: &str) -> zbus::Result<()>;
     fn vm_delete(&self) -> zbus::Result<()>;
     fn vm_info(&self) -> zbus::Result<String>;
+    fn vm_end_snapshot_series(&self) -> zbus::Result<()>;
     fn vm_pause(&self) -> zbus::Result<()>;
     fn vm_nmi(&self) -> zbus::Result<()>;
     fn vm_power_button(&self) -> zbus::Result<()>;
@@ -228,6 +229,10 @@ impl<'a> DBusApi1ProxyBlocking<'a> {
         self.vm_info()
             .map(|info| println!("{info}"))
             .map_err(Error::DBusApiClient)
+    }
+
+    fn api_vm_end_snapshot_series(&self) -> ApiResult {
+        self.vm_end_snapshot_series().map_err(Error::DBusApiClient)
     }
 
     fn api_vm_pause(&self) -> ApiResult {
@@ -352,6 +357,10 @@ fn rest_api_do_command(
         }
         Command::Reboot => {
             simple_api_command(socket, "PUT", "reboot", None).map_err(Error::HttpApiClient)
+        }
+        Command::EndSnapshotSeries => {
+            simple_api_command(socket, "PUT", "end-snapshot-series", None)
+                .map_err(Error::HttpApiClient)
         }
         Command::Pause => {
             simple_api_command(socket, "PUT", "pause", None).map_err(Error::HttpApiClient)
@@ -544,6 +553,7 @@ fn dbus_api_do_command(
         Command::Resume => proxy.api_vm_resume(),
         Command::PowerButton => proxy.api_vm_power_button(),
         Command::Reboot => proxy.api_vm_reboot(),
+        Command::EndSnapshotSeries => proxy.api_vm_end_snapshot_series(),
         Command::Pause => proxy.api_vm_pause(),
         Command::Info => proxy.api_vm_info(),
         Command::BalloonStats => proxy.api_vm_balloon_stats(),
@@ -1037,6 +1047,8 @@ enum Command {
     },
     #[command(about = "Delete a VM")]
     Delete,
+    #[command(about = "End the active diff snapshot series")]
+    EndSnapshotSeries,
     #[command(about = "Info on the VM")]
     Info,
     #[command(about = "Trigger NMI")]

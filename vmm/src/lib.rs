@@ -2684,6 +2684,15 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_end_snapshot_series(&mut self) -> result::Result<(), VmError> {
+        if self.snapshot_series.take().is_some()
+            && let VmOwnership::Owned(ref mut vm) = self.vm
+        {
+            vm.stop_dirty_log().map_err(VmError::Snapshot)?;
+        }
+        Ok(())
+    }
+
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -3852,6 +3861,7 @@ mod tests {
         let mut vmm = create_dummy_vmm();
 
         assert!(matches!(vmm.vm_pause(), Err(VmError::VmNotCreated)));
+        vmm.vm_end_snapshot_series().unwrap();
         assert!(matches!(vmm.vm_resume(), Err(VmError::VmNotCreated)));
         assert!(matches!(vmm.vm_power_button(), Err(VmError::VmNotCreated)));
         assert!(matches!(vmm.vm_shutdown(), Err(VmError::VmNotCreated)));

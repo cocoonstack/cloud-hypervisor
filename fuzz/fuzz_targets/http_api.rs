@@ -97,6 +97,10 @@ impl RequestHandler for StubApiRequestHandler {
         Ok(())
     }
 
+    fn vm_end_snapshot_series(&mut self) -> Result<(), VmError> {
+        Ok(())
+    }
+
     fn vm_pause(&mut self) -> Result<(), VmError> {
         Ok(())
     }
