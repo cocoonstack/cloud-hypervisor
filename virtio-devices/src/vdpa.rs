@@ -533,6 +533,13 @@ impl Snapshottable for Vdpa {
 impl Transportable for Vdpa {}
 
 impl Migratable for Vdpa {
+    fn check_diff_snapshot(&self) -> result::Result<(), MigratableError> {
+        Err(MigratableError::Snapshot(anyhow!(
+            "vDPA device {} does not track dirty pages",
+            self.id
+        )))
+    }
+
     fn notify_started_migration(&mut self) -> result::Result<(), MigratableError> {
         if self.backend_features & (1 << VHOST_BACKEND_F_RESUME) == 0 {
             warn!(
