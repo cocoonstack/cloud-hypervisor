@@ -35,6 +35,7 @@ use std::{iter, path, result, sync};
 
 use acpi_tables::sdt::GenericAddress;
 use acpi_tables::{Aml, aml};
+use anyhow::anyhow;
 #[cfg(target_arch = "x86_64")]
 use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -1050,6 +1051,9 @@ pub struct DeviceManager {
     // information for filling the ACPI VIOT table.
     iommu_attached_devices: Option<(PciBdf, Vec<PciBdf>)>,
 
+    dirty_logging: bool,
+    ejected_while_dirty_logging: bool,
+
     // Emulated SMMUv3s, keyed by the physical SMMUv3 they sit on top of, as
     // one is created per physical SMMUv3.
     #[cfg(target_arch = "aarch64")]
@@ -1422,6 +1426,8 @@ impl DeviceManager {
             iommu_device: None,
             iommu_mapping: None,
             iommu_attached_devices: None,
+            dirty_logging: false,
+            ejected_while_dirty_logging: false,
             #[cfg(target_arch = "aarch64")]
             smmuv3s: BTreeMap::new(),
             pci_segments: pci_segments.into_boxed_slice(),
@@ -5517,6 +5523,15 @@ impl DeviceManager {
         Ok(())
     }
 
+    fn migratable_devices(&self) -> Vec<Arc<Mutex<dyn Migratable>>> {
+        self.device_tree
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, node)| node.migratable.clone())
+            .collect()
+    }
+
     pub fn eject_device(&mut self, pci_segment_id: u16, device_id: u8) -> DeviceManagerResult<()> {
         info!("Ejecting device_id = {device_id} on segment_id={pci_segment_id}");
 
@@ -5531,6 +5546,8 @@ impl DeviceManager {
         {
             return Err(DeviceManagerError::InvalidIommuRemove(pci_device_bdf));
         }
+
+        self.ejected_while_dirty_logging |= self.dirty_logging;
 
         // Give the PCI device ID back to the PCI bus.
         self.pci_segments[pci_segment_id as usize]
@@ -6542,7 +6559,21 @@ impl Snapshottable for DeviceManager {
 impl Transportable for DeviceManager {}
 
 impl Migratable for DeviceManager {
+    fn check_diff_snapshot(&self) -> result::Result<(), MigratableError> {
+        if self.ejected_while_dirty_logging {
+            return Err(MigratableError::Snapshot(anyhow!(
+                "a device was ejected during the snapshot series"
+            )));
+        }
+        for migratable in self.migratable_devices() {
+            migratable.lock().unwrap().check_diff_snapshot()?;
+        }
+        Ok(())
+    }
+
     fn start_dirty_log(&mut self) -> result::Result<(), MigratableError> {
+        self.dirty_logging = true;
+        self.ejected_while_dirty_logging = false;
         for (_, device_node) in self.device_tree.lock().unwrap().iter() {
             if let Some(migratable) = &device_node.migratable {
                 migratable.lock().unwrap().start_dirty_log()?;
@@ -6552,10 +6583,10 @@ impl Migratable for DeviceManager {
     }
 
     fn stop_dirty_log(&mut self) -> result::Result<(), MigratableError> {
-        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
-            if let Some(migratable) = &device_node.migratable {
-                migratable.lock().unwrap().stop_dirty_log()?;
-            }
+        self.dirty_logging = false;
+        self.ejected_while_dirty_logging = false;
+        for migratable in self.migratable_devices() {
+            migratable.lock().unwrap().stop_dirty_log()?;
         }
         Ok(())
     }
