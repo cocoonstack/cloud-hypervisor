@@ -67,9 +67,17 @@ the pages dirtied since the previous snapshot of the series. The first `diff`
 request takes a full baseline and enables dirty-page tracking; each subsequent
 one dumps the delta, so the pause cost is proportional to the amount of dirtied
 memory rather than to the guest RAM size. A `full` request (or any snapshot
-failure, a memory layout change, a migration, a reboot, a shutdown, or
-deleting the VM) ends the series; the next `diff` starts a new one with a
-fresh baseline in a fresh directory.
+failure, a memory layout change, a migration, a reboot, a shutdown, removing a
+device, hot-adding a VFIO device, or deleting the VM) ends the series; the next
+`diff` starts a new one with a fresh baseline in a fresh directory. A `diff` to
+another directory fails and keeps the series.
+
+The first `diff` after a guest ejects a device fails and ends the series, and so
+does the first `diff` after a vhost-user device is hot-added.
+
+A `diff` request fails when the VM has a device whose guest memory writes cannot
+be tracked: a vDPA device, a vfio-user device, or a VFIO device behind a virtual
+IOMMU.
 
 The whole series lives in one directory, and every `diff` request of a series
 must target that same directory:
