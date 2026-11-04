@@ -112,6 +112,10 @@ pub enum ApiError {
     #[error("The VM could not be paused")]
     VmPause(#[source] VmError),
 
+    /// The snapshot series could not end
+    #[error("The snapshot series could not end")]
+    VmEndSnapshotSeries(#[source] VmError),
+
     /// The VM could not resume.
     #[error("The VM could not resume")]
     VmResume(#[source] VmError),
@@ -920,6 +924,8 @@ pub trait RequestHandler {
 
     fn vm_snapshot(&mut self, config: &VmSnapshotConfig) -> Result<(), VmError>;
 
+    fn vm_end_snapshot_series(&mut self) -> Result<(), VmError>;
+
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -1640,6 +1646,39 @@ impl ApiAction for VmInfo {
             ApiResponsePayload::VmInfo(info) => Ok(info),
             _ => Err(ApiError::ResponsePayloadType),
         }
+    }
+}
+
+pub struct VmEndSnapshotSeries;
+
+impl ApiAction for VmEndSnapshotSeries {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmEndSnapshotSeries");
+
+            let response = vmm
+                .vm_end_snapshot_series()
+                .map_err(ApiError::VmEndSnapshotSeries)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
     }
 }
 

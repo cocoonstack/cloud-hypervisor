@@ -22,9 +22,9 @@ use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, Body, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet, VmAddPmem,
     VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBalloonStats, VmBoot, VmCancelMigration, VmCounters,
-    VmCreate, VmDelete, VmInfo, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
-    VmShutdown, VmSnapshot, VmmPing, VmmShutdown,
+    VmCreate, VmDelete, VmEndSnapshotSeries, VmInfo, VmNmi, VmPause, VmPowerButton, VmReboot,
+    VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume,
+    VmSendMigration, VmShutdown, VmSnapshot, VmmPing, VmmShutdown,
 };
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::{Error as VmmError, NetConfig, Result as VmmResult, VmConfig};
@@ -244,6 +244,10 @@ impl DBusApi {
             .await
             .map_err(api_error)?;
         serde_json::to_string(&result).map_err(api_error)
+    }
+
+    async fn vm_end_snapshot_series(&self) -> Result<()> {
+        self.vm_action(&VmEndSnapshotSeries, ()).await.map(|_| ())
     }
 
     async fn vm_pause(&self) -> Result<()> {

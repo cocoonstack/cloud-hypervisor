@@ -75,6 +75,10 @@ another directory fails and keeps the series.
 The first `diff` after a guest ejects a device fails and ends the series, and so
 does the first `diff` after a vhost-user device is hot-added.
 
+`PUT /vm.end-snapshot-series` (`ch-remote end-snapshot-series`) ends a series
+without taking a snapshot and stops dirty-page tracking. It succeeds when no
+series is active.
+
 A `diff` request fails when the VM has a device whose guest memory writes cannot
 be tracked: a vDPA device, a vfio-user device, or a VFIO device behind a virtual
 IOMMU.
