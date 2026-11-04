@@ -3125,6 +3125,10 @@ impl Transportable for Vm {
 }
 
 impl Migratable for Vm {
+    fn check_diff_snapshot(&self) -> result::Result<(), MigratableError> {
+        self.device_manager.lock().unwrap().check_diff_snapshot()
+    }
+
     fn start_dirty_log(&mut self) -> result::Result<(), MigratableError> {
         self.memory_manager.lock().unwrap().start_dirty_log()?;
         self.device_manager.lock().unwrap().start_dirty_log()
