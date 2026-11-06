@@ -53,19 +53,21 @@ use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
+#[cfg(feature = "kvm")]
+use crate::configuration::COMMAND_REG_MEMORY_SPACE_MASK;
 use crate::configuration::{
-    COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK, PCI_EXP_FLAGS_TYPE_MASK, PCI_EXP_FLAGS_VERS_MASK,
-    PCI_EXP_FLAGS_VERS_SHIFT, PCI_EXP_LNKCTL, PCI_EXP_LNKCTL2, PCI_EXP_TYPE_RC_END,
-    PCI_EXT_CAP_ALIGN, PCI_EXT_CAP_NEXT_MASK, PCI_EXT_CAP_NEXT_SHIFT, PCIE_CONFIG_SPACE_SIZE,
+    COMMAND_REG, PCI_EXP_FLAGS_TYPE_MASK, PCI_EXP_FLAGS_VERS_MASK, PCI_EXP_FLAGS_VERS_SHIFT,
+    PCI_EXP_LNKCTL, PCI_EXP_LNKCTL2, PCI_EXP_TYPE_RC_END, PCI_EXT_CAP_ALIGN, PCI_EXT_CAP_NEXT_MASK,
+    PCI_EXT_CAP_NEXT_SHIFT, PCIE_CONFIG_SPACE_SIZE,
 };
 use crate::mmap::MmapRegion;
 use crate::msi::{Error as MsiError, MSI_CONFIG_ID, MsiConfigState};
 use crate::msix::{Error as MsixError, MaybeMutInterruptSourceGroup, MsixConfigState};
 use crate::{
-    BarReprogrammingParams, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig, MsixCap,
-    MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
-    PciBdf, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError,
-    PciExpressCapability, PciExpressCapabilityId, PciHeaderType, PciSubclass,
+    BarRelocation, InstallParams, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig,
+    MsixCap, MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable,
+    PciBarRegionType, PciBdf, PciCapabilityId, PciClassCode, PciConfiguration, PciDevice,
+    PciDeviceError, PciExpressCapability, PciExpressCapabilityId, PciHeaderType, PciSubclass,
     msi_num_enabled_vectors,
 };
 
@@ -320,6 +322,9 @@ pub(crate) struct UserMemoryRegion {
     pub mapping: Arc<MmapRegion>,
     #[cfg(feature = "kvm")]
     pub dma_buf: Option<Arc<OwnedFd>>,
+    /// Whether the region is mapped into the host IOMMU address space for
+    /// peer-to-peer DMA.
+    pub p2p_mapped: bool,
 }
 
 impl UserMemoryRegion {
@@ -360,6 +365,7 @@ impl UserMemoryRegion {
                 .map_err(|e| VfioPciError::DmaMapFile(e, device_path.to_path_buf(), bdf))?;
 
             self.dma_buf = Some(Arc::new(OwnedFd::from(dma_buf)));
+            self.p2p_mapped = true;
 
             return Ok(());
         }
@@ -374,7 +380,10 @@ impl UserMemoryRegion {
         // points to self.mapping.len() bytes of valid memory that will only
         // be unmapped with munmap().
         unsafe { vfio_ops.vfio_dma_map(self.start, self.mapping.len(), self.mapping.addr()) }
-            .map_err(|e| VfioPciError::DmaMap(e, device_path.to_path_buf(), bdf))
+            .map_err(|e| VfioPciError::DmaMap(e, device_path.to_path_buf(), bdf))?;
+        self.p2p_mapped = true;
+
+        Ok(())
     }
 }
 
@@ -1156,6 +1165,9 @@ impl VfioCommon {
         mmio64_allocator: &mut AddressAllocator,
     ) -> Result<(), PciDeviceError> {
         for region in self.mmio_regions.iter() {
+            if self.configuration.is_bar_released(region.index as usize) {
+                continue;
+            }
             match region.type_ {
                 PciBarRegionType::IoRegion => {
                     allocator.free_io_addresses(region.start, region.length);
@@ -1747,7 +1759,7 @@ impl VfioCommon {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         // When the guest wants to write to a BAR, we trap it into
         // our local configuration space. We're not reprogramming
         // VFIO device.
@@ -1769,7 +1781,7 @@ impl VfioCommon {
                 let device_writes = patch.write(offset, data);
 
                 if patch.mask == 0xffff_ffff {
-                    return (Vec::new(), None);
+                    return (BarRelocation::default(), None);
                 }
 
                 device_writes
@@ -1812,46 +1824,32 @@ impl VfioCommon {
             self.vfio_wrapper.write_config((reg + offset) as u32, data);
         }
 
-        // The non BAR write path goes directly to the VFIO device and not the shadow,
-        // so the PciConfiguration shadow can get stale. Mirror the write into the
-        // shadow here since snapshot() serializes it. Without this the shadow keeps its
-        // device init values and a snapshot encodes PCI_COMMAND as zero.
-        //
-        // Use the raw write_* helpers rather than the PciConfiguration method
-        // self.configuration.write_config_register(), which would otherwise drain
-        // pending_bar_reprogram, owned by the BAR block below, and rerun MSI-X
-        // set_msg_ctl, already done by update_msix_capabilities above.
-        let byte_offset = reg_idx * PCI_CONFIG_REGISTER_SIZE + offset as usize;
-        match data.len() {
-            1 => self.configuration.write_byte(byte_offset, data[0]),
-            2 => self
-                .configuration
-                .write_word(byte_offset, u16::from(data[0]) | (u16::from(data[1]) << 8)),
-            4 => self.configuration.write_reg(
-                reg_idx,
-                u32::from_le_bytes(data.try_into().expect("data should be 4 bytes")),
-            ),
-            _ => {}
-        }
+        // Mirror the write into the shadow, which snapshot() serializes and
+        // which installs released BARs on COMMAND writes. MSI-X was handled
+        // above and BAR writes returned early, so write the raw bytes.
+        let mut reloc = BarRelocation::default();
+        if offset as usize + data.len() <= 4 {
+            match data.len() {
+                1 => self
+                    .configuration
+                    .write_byte(reg_idx * 4 + offset as usize, data[0]),
+                2 => self.configuration.write_word(
+                    reg_idx * 4 + offset as usize,
+                    u16::from(data[0]) | (u16::from(data[1]) << 8),
+                ),
+                4 => self.configuration.write_reg(
+                    reg_idx,
+                    u32::from_le_bytes(data.try_into().expect("data should be 4 bytes")),
+                ),
+                _ => (),
+            }
 
-        // Return pending BAR repgrogramming if MSE bit is set
-        let mut ret_param = self.configuration.pending_bar_reprogram();
-        if !ret_param.is_empty() {
-            if self.read_config_register(COMMAND_REG) & COMMAND_REG_MEMORY_SPACE_MASK
-                == COMMAND_REG_MEMORY_SPACE_MASK
-            {
-                info!("BAR reprogramming parameter is returned: {ret_param:x?}");
-                self.configuration.clear_pending_bar_reprogram();
-            } else {
-                info!(
-                    "MSE bit is disabled. No BAR reprogramming parameter is returned: {ret_param:x?}"
-                );
-
-                ret_param = Vec::new();
+            if reg_idx == COMMAND_REG {
+                self.configuration.drain_pending_installs(&mut reloc);
             }
         }
 
-        (ret_param, None)
+        (reloc, None)
     }
 
     pub(crate) fn read_config_register(&mut self, reg_idx: usize) -> u32 {
@@ -2491,6 +2489,7 @@ impl VfioPciDevice {
                         mapping: Arc::new(mapping),
                         #[cfg(feature = "kvm")]
                         dma_buf: None,
+                        p2p_mapped: false,
                     };
                     // SAFETY: MmapRegion invariants guarantee that
                     // user_memory_region.mapping.addr() points to
@@ -2558,11 +2557,22 @@ impl VfioPciDevice {
             ("unmap", "Unmapped")
         };
 
-        for mmio_region in self.common.mmio_regions.iter() {
-            for user_memory_region in mmio_region.user_memory_regions.iter() {
+        for mmio_region in self.common.mmio_regions.iter_mut() {
+            // A released BAR is mapped by its install, at its new address.
+            if self
+                .common
+                .configuration
+                .is_bar_released(mmio_region.index as usize)
+            {
+                continue;
+            }
+            for user_memory_region in mmio_region.user_memory_regions.iter_mut() {
                 let Some(dma_buf) = &user_memory_region.dma_buf else {
                     continue;
                 };
+                if user_memory_region.p2p_mapped == memory_space_enabled {
+                    continue;
+                }
                 let iova = user_memory_region.start;
                 let length = user_memory_region.mapping.len() as u64;
 
@@ -2575,11 +2585,14 @@ impl VfioPciDevice {
                 };
 
                 match res {
-                    Ok(()) => debug!(
-                        "{success_action} region {} of device {} at 0x{iova:x} \
-                         through its dma-buf",
-                        mmio_region.index, self.bdf
-                    ),
+                    Ok(()) => {
+                        user_memory_region.p2p_mapped = memory_space_enabled;
+                        debug!(
+                            "{success_action} region {} of device {} at 0x{iova:x} \
+                             through its dma-buf",
+                            mmio_region.index, self.bdf
+                        );
+                    }
                     Err(e) => error!(
                         "Could not {failed_action} region {} of device {} at 0x{iova:x}: {e}",
                         mmio_region.index, self.bdf
@@ -2593,12 +2606,22 @@ impl VfioPciDevice {
 
     pub fn unmap_mmio_regions(&mut self) {
         for region in self.common.mmio_regions.iter_mut() {
+            // A released BAR is already unmapped; only free its memory slots.
+            let released = self
+                .common
+                .configuration
+                .is_bar_released(region.index as usize);
             for user_memory_region in region.user_memory_regions.drain(..) {
+                if released {
+                    self.memory_slot_allocator
+                        .free_memory_slot(user_memory_region.slot);
+                    continue;
+                }
                 let len = user_memory_region.mapping.len();
                 let host_addr = user_memory_region.mapping.addr();
                 // Unmap MMIO region from the host IOMMU address space via VfioOps
                 // Only needed if p2p_dma is enabled.
-                if self.p2p_dma_mapped
+                if user_memory_region.p2p_mapped
                     && let Err(e) = self
                         .vfio_ops
                         .vfio_dma_unmap(user_memory_region.start, len)
@@ -2746,7 +2769,7 @@ impl PciDevice for VfioPciDevice {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         #[cfg(feature = "kvm")]
         let memory_space_enabled = reg_idx == COMMAND_REG && self.is_memory_space_enabled();
 
@@ -2772,33 +2795,29 @@ impl PciDevice for VfioPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> Result<(), io::Error> {
         for region in self.common.mmio_regions.iter_mut() {
             if region.index as usize == bar_idx {
-                let region_index = region.index;
-                let old_base = region.start.raw_value();
-                let map_p2p = self.p2p_dma_mapped && region.is_p2p_mappable();
-                region.start = GuestAddress(new_base);
-
                 for user_memory_region in region.user_memory_regions.iter_mut() {
                     let len = user_memory_region.mapping.len();
                     let host_addr = user_memory_region.mapping.addr();
-                    let offset = user_memory_region.start - old_base;
                     // Unmap the old MMIO region from the host IOMMU address space via VfioOps
                     // Only needed if p2p_dma is enabled.
-                    if map_p2p
-                        && let Err(e) = self
+                    if user_memory_region.p2p_mapped {
+                        user_memory_region.p2p_mapped = false;
+                        if let Err(e) = self
                             .vfio_ops
                             .vfio_dma_unmap(user_memory_region.start, len)
                             .map_err(|e| {
                                 VfioPciError::DmaUnmap(e, self.device_path.clone(), self.bdf)
                             })
-                    {
-                        error!(
-                            "Could not unmap MMIO region from the host IOMMU address space: \
+                        {
+                            error!(
+                                "Could not unmap MMIO region from the host IOMMU address space: \
 iova 0x{:x}, size 0x{:x}: {}, ",
-                            user_memory_region.start, len, e
-                        );
+                                user_memory_region.start, len, e
+                            );
+                        }
                     }
                     // Remove old region
                     // SAFETY: MmapRegion invariants guarantee that
@@ -2814,6 +2833,25 @@ iova 0x{:x}, size 0x{:x}: {}, ",
                         )
                     }
                     .map_err(io::Error::other)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        for region in self.common.mmio_regions.iter_mut() {
+            if region.index as usize == bar_idx {
+                let region_index = region.index;
+                let old_base = region.start.raw_value();
+                let map_p2p = self.p2p_dma_mapped && region.is_p2p_mappable();
+                region.start = GuestAddress(new_base);
+
+                for user_memory_region in region.user_memory_regions.iter_mut() {
+                    let len = user_memory_region.mapping.len();
+                    let host_addr = user_memory_region.mapping.addr();
+                    let offset = user_memory_region.start - old_base;
 
                     // Update the user memory region with the correct start address.
                     if new_base > old_base {
@@ -2866,8 +2904,16 @@ iova 0x{:x}, size 0x{:x}: {}, ",
         Ok(())
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.common.configuration.restore_bar_addr(params);
+    fn is_bar_released(&self, bar_idx: usize) -> bool {
+        self.common.configuration.is_bar_released(bar_idx)
+    }
+
+    fn on_bar_installed(&mut self, bar_idx: usize) {
+        self.common.configuration.on_bar_installed(bar_idx);
+    }
+
+    fn pending_bar_installs(&self) -> Vec<InstallParams> {
+        self.common.configuration.pending_bar_installs()
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
@@ -3105,6 +3151,7 @@ mod tests {
                     mapping: mapping_a,
                     #[cfg(feature = "kvm")]
                     dma_buf: None,
+                    p2p_mapped: false,
                 },
                 UserMemoryRegion {
                     slot: 1,
@@ -3112,6 +3159,7 @@ mod tests {
                     mapping: mapping_b,
                     #[cfg(feature = "kvm")]
                     dma_buf: None,
+                    p2p_mapped: false,
                 },
             ],
         }]
