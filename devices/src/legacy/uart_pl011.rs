@@ -48,6 +48,8 @@ const PL011_ID: [u8; 8] = [0x11, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
 const AMBA_ID_LOW: u64 = 0x3f8;
 const AMBA_ID_HIGH: u64 = 0x401;
 
+const READ_FIFO_SIZE: usize = 0x1000;
+
 #[derive(Debug, Error)]
 pub(super) enum Error {
     #[error("PL011 write: Bad write offset: {0}")]
@@ -124,7 +126,7 @@ impl Pl011 {
             debug,
             int_enabled,
             int_level,
-            read_fifo,
+            saved_input,
             ilpr,
             ibrd,
             fbrd,
@@ -141,7 +143,7 @@ impl Pl011 {
                 state.debug,
                 state.int_enabled,
                 state.int_level,
-                state.read_fifo.into(),
+                state.read_fifo,
                 state.ilpr,
                 state.ibrd,
                 state.fbrd,
@@ -159,7 +161,7 @@ impl Pl011 {
                 0,
                 0,
                 0,
-                VecDeque::new(),
+                Vec::new(),
                 0,
                 0,
                 0,
@@ -168,6 +170,10 @@ impl Pl011 {
                 1,
             )
         };
+
+        // Allocate the whole FIFO here so that queuing input never reallocates.
+        let mut read_fifo = VecDeque::with_capacity(READ_FIFO_SIZE.max(saved_input.len()));
+        read_fifo.extend(saved_input);
 
         Self {
             id,
@@ -216,10 +222,17 @@ impl Pl011 {
         }
     }
 
-    /// Queues raw bytes for the guest to read and signals the interrupt
-    pub fn queue_input_bytes(&mut self, c: &[u8]) -> errno::Result<()> {
-        self.read_fifo.extend(c);
-        self.read_count += c.len() as u32;
+    /// Queues raw bytes for the guest to read and signals the interrupt. Returns how many bytes
+    /// the device took; the caller retries the rest after the guest has read some input.
+    pub fn queue_input_bytes(&mut self, c: &[u8]) -> errno::Result<usize> {
+        let count = c
+            .len()
+            .min(READ_FIFO_SIZE.saturating_sub(self.read_fifo.len()));
+        if count == 0 {
+            return Ok(0);
+        }
+        self.read_fifo.extend(&c[..count]);
+        self.read_count += count as u32;
         self.flags &= !PL011_FLAG_RXFE;
 
         if ((self.lcr & 0x10) == 0) || (self.read_count == 16) {
@@ -231,7 +244,7 @@ impl Pl011 {
             self.trigger_interrupt()?;
         }
 
-        Ok(())
+        Ok(count)
     }
 
     pub fn flush_output(&mut self) -> io::Result<()> {
@@ -561,5 +574,36 @@ mod tests {
         assert_eq!(data[0], b'b');
         pl011.read(0, UARTDR, &mut data);
         assert_eq!(data[0], b'c');
+    }
+
+    #[test]
+    fn pl011_input_bounded() {
+        let intr_evt = EventFd::new(0).unwrap();
+        let mut pl011 = Pl011::new(
+            String::from(SERIAL_NAME),
+            Arc::new(TestInterrupt::new(intr_evt.try_clone().unwrap())),
+            None,
+            Instant::now(),
+            None,
+        );
+        let capacity = pl011.read_fifo.capacity();
+        let input = [b'x'; 64];
+
+        let mut queued = 0;
+        while queued < READ_FIFO_SIZE {
+            queued += pl011.queue_input_bytes(&input).unwrap();
+        }
+        assert_eq!(queued, READ_FIFO_SIZE);
+        assert_eq!(pl011.queue_input_bytes(&input).unwrap(), 0);
+        assert_eq!(pl011.read_fifo.len(), READ_FIFO_SIZE);
+        assert_eq!(pl011.read_fifo.capacity(), capacity);
+
+        let mut data = [0u8];
+        for _ in 0..3 {
+            pl011.read(0, UARTDR, &mut data);
+        }
+        assert_eq!(pl011.queue_input_bytes(&input).unwrap(), 3);
+        assert_eq!(pl011.read_fifo.len(), READ_FIFO_SIZE);
+        assert_eq!(pl011.read_fifo.capacity(), capacity);
     }
 }
