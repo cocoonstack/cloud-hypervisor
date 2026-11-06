@@ -2905,6 +2905,14 @@ impl VfioPciDevice {
         };
 
         for mmio_region in self.common.bars.iter_mut() {
+            // A released BAR is mapped by its install, at its new address.
+            if self
+                .common
+                .configuration
+                .is_bar_released(mmio_region.index as usize)
+            {
+                continue;
+            }
             for bar_memory_region in mmio_region.bar_memory_regions.iter_mut() {
                 let Some(p2p_mapping) = &bar_memory_region.p2p_mapping else {
                     continue;
@@ -2915,6 +2923,9 @@ impl VfioPciDevice {
                 let Some(dma_buf) = &p2p_mapping.dma_buf else {
                     continue;
                 };
+                if p2p_mapping.mapped == memory_space_enabled {
+                    continue;
+                }
 
                 let res = if memory_space_enabled {
                     vfio_iommufd
