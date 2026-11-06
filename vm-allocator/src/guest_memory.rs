@@ -178,6 +178,28 @@ impl GuestRegion {
         self.registered.load(Ordering::Acquire)
     }
 
+    /// Remove the hypervisor registration, keeping the slot and the mapping.
+    pub fn unregister(&mut self) -> Result<(), Error> {
+        if !*self.registered.get_mut() {
+            return Ok(());
+        }
+        let vm = self.vm.as_ref().unwrap();
+        let slot = self.slot.unwrap();
+        // SAFETY: exclusive access keeps the region and its mapping alive.
+        unsafe {
+            vm.remove_user_memory_region(
+                slot,
+                self.region.start_addr().raw_value(),
+                self.region.size(),
+                self.region.as_ptr(),
+                false,
+            )
+        }
+        .map_err(Error::RemoveRegion)?;
+        *self.registered.get_mut() = false;
+        Ok(())
+    }
+
     /// Move a region to a new guest address without replacing its mapping.
     /// Unregistered regions remain unregistered. If removing a registered
     /// region fails, its old registration remains. If replacement fails,
