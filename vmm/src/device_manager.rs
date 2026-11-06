@@ -1202,6 +1202,18 @@ fn use_64bit_bar_for_virtio_device(
     pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32 || is_hotplug
 }
 
+fn is_ejected(
+    snapshot: Option<&Snapshot>,
+    device_tree: &Mutex<DeviceTree>,
+    pci_common: &PciDeviceCommonConfig,
+) -> bool {
+    snapshot.is_some()
+        && pci_common
+            .id
+            .as_ref()
+            .is_some_and(|id| !device_tree.lock().unwrap().contains_key(id))
+}
+
 fn remove_ejected_device(config: &mut VmConfig, id: &str) -> DeviceManagerResult<()> {
     if config.remove_device(id) {
         Ok(())
@@ -3058,6 +3070,9 @@ impl DeviceManager {
         let mut block_devices = self.config.lock().unwrap().disks.take();
         if let Some(disk_list_cfg) = &mut block_devices {
             for disk_cfg in disk_list_cfg.iter_mut() {
+                if is_ejected(snapshot, &self.device_tree, &disk_cfg.pci_common) {
+                    continue;
+                }
                 let device = self.make_virtio_block_device(disk_cfg, false, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -3234,6 +3249,9 @@ impl DeviceManager {
         let mut net_devices = self.config.lock().unwrap().net.take();
         if let Some(net_list_cfg) = &mut net_devices {
             for net_cfg in net_list_cfg.iter_mut() {
+                if is_ejected(snapshot, &self.device_tree, &net_cfg.pci_common) {
+                    continue;
+                }
                 let device = self.make_virtio_net_device(net_cfg, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -3398,6 +3416,13 @@ impl DeviceManager {
         let mut generic_vhost_user_devices = self.config.lock().unwrap().generic_vhost_user.clone();
         if let Some(generic_vhost_user_list_cfg) = &mut generic_vhost_user_devices {
             for generic_vhost_user_cfg in generic_vhost_user_list_cfg.iter_mut() {
+                if is_ejected(
+                    snapshot,
+                    &self.device_tree,
+                    &generic_vhost_user_cfg.pci_common,
+                ) {
+                    continue;
+                }
                 let device =
                     self.make_generic_vhost_user_device(generic_vhost_user_cfg, snapshot)?;
                 self.virtio_devices.push(device);
@@ -3465,6 +3490,9 @@ impl DeviceManager {
         let mut fs_devices = self.config.lock().unwrap().fs.take();
         if let Some(fs_list_cfg) = &mut fs_devices {
             for fs_cfg in fs_list_cfg.iter_mut() {
+                if is_ejected(snapshot, &self.device_tree, &fs_cfg.pci_common) {
+                    continue;
+                }
                 let device = self.make_virtio_fs_device(fs_cfg, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -3660,6 +3688,9 @@ impl DeviceManager {
         let mut pmem_devices = self.config.lock().unwrap().pmem.take();
         if let Some(pmem_list_cfg) = &mut pmem_devices {
             for pmem_cfg in pmem_list_cfg.iter_mut() {
+                if is_ejected(snapshot, &self.device_tree, &pmem_cfg.pci_common) {
+                    continue;
+                }
                 let device = self.make_virtio_pmem_device(pmem_cfg, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -3730,7 +3761,9 @@ impl DeviceManager {
         snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<()> {
         let mut vsock = self.config.lock().unwrap().vsock.take();
-        if let Some(vsock_cfg) = &mut vsock {
+        if let Some(vsock_cfg) = &mut vsock
+            && !is_ejected(snapshot, &self.device_tree, &vsock_cfg.pci_common)
+        {
             let device = self.make_virtio_vsock_device(vsock_cfg, snapshot)?;
             self.virtio_devices.push(device);
         }
@@ -3996,6 +4029,9 @@ impl DeviceManager {
         let mut vdpa_devices = self.config.lock().unwrap().vdpa.take();
         if let Some(vdpa_list_cfg) = &mut vdpa_devices {
             for vdpa_cfg in vdpa_list_cfg.iter_mut() {
+                if is_ejected(snapshot, &self.device_tree, &vdpa_cfg.pci_common) {
+                    continue;
+                }
                 let device = self.make_vdpa_device(vdpa_cfg, snapshot)?;
                 self.virtio_devices.push(device);
             }
@@ -4772,6 +4808,9 @@ impl DeviceManager {
 
         if let Some(device_list_cfg) = &mut devices {
             for device_cfg in device_list_cfg.iter_mut() {
+                if is_ejected(snapshot, &self.device_tree, &device_cfg.pci_common) {
+                    continue;
+                }
                 let (device_id, _) = self.add_passthrough_device(device_cfg, snapshot)?;
                 if device_cfg.pci_common.iommu.attached() && self.iommu_device.is_some() {
                     iommu_attached_device_ids.push(device_id);
@@ -4911,6 +4950,9 @@ impl DeviceManager {
 
         if let Some(device_list_cfg) = &mut user_devices {
             for device_cfg in device_list_cfg.iter_mut() {
+                if is_ejected(snapshot, &self.device_tree, &device_cfg.pci_common) {
+                    continue;
+                }
                 let (_device_id, _id) = self.add_vfio_user_device(device_cfg, snapshot)?;
             }
         }
@@ -6874,6 +6916,33 @@ mod tests {
             1,
             false,
         ));
+    }
+
+    #[test]
+    fn test_is_ejected() {
+        let snapshot = Snapshot::default();
+        let device_tree = Mutex::new(DeviceTree::new());
+        device_tree.lock().unwrap().insert(
+            "_disk0".to_string(),
+            DeviceNode::new("_disk0".to_string(), None),
+        );
+        let common = |id: Option<&str>| PciDeviceCommonConfig {
+            id: id.map(str::to_owned),
+            ..Default::default()
+        };
+
+        assert!(!is_ejected(None, &device_tree, &common(Some("_disk1"))));
+        assert!(!is_ejected(
+            Some(&snapshot),
+            &device_tree,
+            &common(Some("_disk0"))
+        ));
+        assert!(is_ejected(
+            Some(&snapshot),
+            &device_tree,
+            &common(Some("_disk1"))
+        ));
+        assert!(!is_ejected(Some(&snapshot), &device_tree, &common(None)));
     }
 
     #[test]
