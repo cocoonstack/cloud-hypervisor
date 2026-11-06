@@ -2593,10 +2593,21 @@ impl VfioPciDevice {
         };
 
         for mmio_region in self.common.mmio_regions.iter_mut() {
+            // A released BAR is mapped by its install, at its new address.
+            if self
+                .common
+                .configuration
+                .is_bar_released(mmio_region.index as usize)
+            {
+                continue;
+            }
             for user_memory_region in mmio_region.user_memory_regions.iter_mut() {
                 let Some(dma_buf) = &user_memory_region.dma_buf else {
                     continue;
                 };
+                if user_memory_region.p2p_mapped == memory_space_enabled {
+                    continue;
+                }
                 let iova = user_memory_region.start();
                 let length = user_memory_region.size() as u64;
 
