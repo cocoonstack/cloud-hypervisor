@@ -16,6 +16,7 @@ use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottabl
 use vmm_sys_util::errno::Result;
 
 const LOOP_SIZE: usize = 0x40;
+const IN_BUFFER_SIZE: usize = 0x1000;
 
 const DATA: u8 = 0;
 const IER: u8 = 1;
@@ -101,7 +102,7 @@ impl Serial {
             modem_status,
             scratch,
             baud_divisor,
-            in_buffer,
+            saved_input,
         ) = if let Some(state) = state {
             (
                 state.interrupt_enable,
@@ -112,7 +113,7 @@ impl Serial {
                 state.modem_status,
                 state.scratch,
                 state.baud_divisor,
-                state.in_buffer.into(),
+                state.in_buffer,
             )
         } else {
             (
@@ -124,9 +125,13 @@ impl Serial {
                 DEFAULT_MODEM_STATUS,
                 0,
                 DEFAULT_BAUD_DIVISOR,
-                VecDeque::new(),
+                Vec::new(),
             )
         };
+
+        // Allocate the whole buffer here so that queuing input never reallocates.
+        let mut in_buffer = VecDeque::with_capacity(IN_BUFFER_SIZE.max(saved_input.len()));
+        in_buffer.extend(saved_input);
 
         Serial {
             id,
@@ -168,13 +173,21 @@ impl Serial {
     }
 
     /// Queues raw bytes for the guest to read and signals the interrupt if the line status would
-    /// change.
-    pub fn queue_input_bytes(&mut self, c: &[u8]) -> Result<()> {
-        if !self.is_loop() {
-            self.in_buffer.extend(c);
-            self.recv_data()?;
+    /// change. Returns how many bytes the device took; the caller retries the rest after the guest
+    /// has read some input.
+    pub fn queue_input_bytes(&mut self, c: &[u8]) -> Result<usize> {
+        if self.is_loop() {
+            return Ok(c.len());
         }
-        Ok(())
+        let count = c
+            .len()
+            .min(IN_BUFFER_SIZE.saturating_sub(self.in_buffer.len()));
+        if count == 0 {
+            return Ok(0);
+        }
+        self.in_buffer.extend(&c[..count]);
+        self.recv_data()?;
+        Ok(count)
     }
 
     pub fn flush_output(&mut self) -> io::Result<()> {
@@ -492,6 +505,35 @@ mod tests {
         // check if reading from the largest u8 offset returns 0
         serial.read(0, 0xff, &mut data[..]);
         assert_eq!(data[0], 0);
+    }
+
+    #[test]
+    fn serial_input_bounded() {
+        let intr_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new_sink(
+            String::from(SERIAL_NAME),
+            Arc::new(TestInterrupt::new(intr_evt.try_clone().unwrap())),
+            None,
+        );
+        let capacity = serial.in_buffer.capacity();
+        let input = [b'x'; 64];
+
+        let mut queued = 0;
+        while queued < IN_BUFFER_SIZE {
+            queued += serial.queue_input_bytes(&input).unwrap();
+        }
+        assert_eq!(queued, IN_BUFFER_SIZE);
+        assert_eq!(serial.queue_input_bytes(&input).unwrap(), 0);
+        assert_eq!(serial.in_buffer.len(), IN_BUFFER_SIZE);
+        assert_eq!(serial.in_buffer.capacity(), capacity);
+
+        let mut data = [0u8];
+        for _ in 0..3 {
+            serial.read(0, DATA as u64, &mut data[..]);
+        }
+        assert_eq!(serial.queue_input_bytes(&input).unwrap(), 3);
+        assert_eq!(serial.in_buffer.len(), IN_BUFFER_SIZE);
+        assert_eq!(serial.in_buffer.capacity(), capacity);
     }
 
     #[test]
