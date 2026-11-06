@@ -1202,6 +1202,14 @@ fn use_64bit_bar_for_virtio_device(
     pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32 || is_hotplug
 }
 
+fn remove_ejected_device(config: &mut VmConfig, id: &str) -> DeviceManagerResult<()> {
+    if config.remove_device(id) {
+        Ok(())
+    } else {
+        Err(DeviceManagerError::UnknownDeviceId(id.to_string()))
+    }
+}
+
 impl DeviceManager {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
@@ -5439,15 +5447,6 @@ impl DeviceManager {
     }
 
     pub fn remove_device(&mut self, id: &str) -> DeviceManagerResult<()> {
-        // The node can be directly a PCI node in case the 'id' refers to a
-        // VFIO device or a virtio-pci one.
-        // In case the 'id' refers to a virtio device, we must find the PCI
-        // node by looking at the parent.
-        let device_tree = self.device_tree.lock().unwrap();
-        let node = device_tree
-            .get(id)
-            .ok_or_else(|| DeviceManagerError::UnknownDeviceId(id.to_string()))?;
-
         // Release advisory locks by dropping all references.
         // Linux automatically releases all locks of that file if the last open FD is closed.
         {
@@ -5464,6 +5463,15 @@ impl DeviceManager {
                 let _ = self.block_devices.swap_remove(index);
             }
         }
+
+        // The node can be directly a PCI node in case the 'id' refers to a
+        // VFIO device or a virtio-pci one.
+        // In case the 'id' refers to a virtio device, we must find the PCI
+        // node by looking at the parent.
+        let device_tree = self.device_tree.lock().unwrap();
+        let Some(node) = device_tree.get(id) else {
+            return remove_ejected_device(&mut self.config.lock().unwrap(), id);
+        };
 
         let pci_device_node = if node.pci_bdf.is_some() && node.pci_device_handle.is_some() {
             node
@@ -6865,6 +6873,27 @@ mod tests {
             VirtioDeviceType::Block as u32,
             1,
             false,
+        ));
+    }
+
+    #[test]
+    fn test_remove_ejected_device() {
+        let mut config: VmConfig = serde_json::from_str("{}").unwrap();
+        config.disks = Some(vec![
+            DiskConfig::parse("path=/tmp/disk0,id=_disk0").unwrap(),
+        ]);
+
+        remove_ejected_device(&mut config, "_disk0").unwrap();
+        assert!(config.disks.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_remove_ejected_device_unknown_id() {
+        let mut config: VmConfig = serde_json::from_str("{}").unwrap();
+
+        assert!(matches!(
+            remove_ejected_device(&mut config, "_disk0"),
+            Err(DeviceManagerError::UnknownDeviceId(id)) if id == "_disk0"
         ));
     }
 
