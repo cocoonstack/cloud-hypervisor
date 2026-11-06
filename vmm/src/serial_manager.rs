@@ -92,6 +92,7 @@ pub(crate) enum EpollDispatch {
     Unknown,
 }
 const EPOLL_EVENTS_LEN: usize = 4;
+const INPUT_RETRY_MS: i32 = 10;
 
 impl From<u64> for EpollDispatch {
     fn from(v: u64) -> Self {
@@ -253,6 +254,36 @@ impl SerialManager {
         Ok(())
     }
 
+    fn input_fd(
+        transport: &ConsoleTransport,
+        socket_console: Option<&SocketConsole>,
+    ) -> Option<RawFd> {
+        match transport {
+            ConsoleTransport::Pty(file) | ConsoleTransport::Tty(file) => Some(file.as_raw_fd()),
+            ConsoleTransport::Socket(_) | ConsoleTransport::TcpListen(_) => {
+                socket_console.and_then(SocketConsole::client_fd)
+            }
+            _ => None,
+        }
+    }
+
+    // Stops or resumes reading the input fd. A stopped fd reports a hang-up
+    // once and then stays quiet until it is resumed.
+    fn set_input_enabled(epoll_fd: RawFd, fd: RawFd, enabled: bool) -> Result<()> {
+        let events = if enabled {
+            epoll::Events::EPOLLIN
+        } else {
+            epoll::Events::EPOLLONESHOT
+        };
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_MOD,
+            fd,
+            epoll::Event::new(events, EpollDispatch::File as u64),
+        )
+        .map_err(Error::Epoll)
+    }
+
     pub(crate) fn start_thread(
         &mut self,
         exit_evt: EventFd,
@@ -284,6 +315,10 @@ impl SerialManager {
 
                     let mut events =
                         [epoll::Event::new(epoll::Events::empty(), 0); EPOLL_EVENTS_LEN];
+                    // Input the device could not take yet. The input fd stays
+                    // stopped until the guest has read it, so the client blocks.
+                    let mut input = [0u8; 64];
+                    let mut backlog = 0..0;
 
                     loop {
                         // In case of PTY, we want to be able to detect a connection on the
@@ -292,7 +327,13 @@ impl SerialManager {
                         // epoll_wait() function to return after the timeout expired.
                         // In case of TTY, we don't expect to detect such behavior, which is
                         // why we can afford to block until an actual event is triggered.
-                        let timeout = if pty_write_out.is_some() { 500 } else { -1 };
+                        let timeout = if !backlog.is_empty() {
+                            INPUT_RETRY_MS
+                        } else if pty_write_out.is_some() {
+                            500
+                        } else {
+                            -1
+                        };
 
                         let num_events =
                             match epoll::wait(epoll_fd.as_raw_fd(), timeout, &mut events[..]) {
@@ -312,8 +353,26 @@ impl SerialManager {
                                 }
                             };
 
+                        let was_backlogged = !backlog.is_empty();
+                        if was_backlogged {
+                            backlog.start += serial
+                                .as_ref()
+                                .lock()
+                                .unwrap()
+                                .queue_input_bytes(&input[backlog.clone()])
+                                .map_err(Error::QueueInput)?;
+                            if backlog.is_empty()
+                                && let Some(fd) =
+                                    Self::input_fd(&transport, socket_console.as_ref())
+                            {
+                                Self::set_input_enabled(epoll_fd.as_raw_fd(), fd, true)?;
+                            }
+                        }
+
                         if num_events == 0 {
-                            if matches!(transport, ConsoleTransport::Pty(_)) {
+                            // A stopped input fd reports no hang-up, so a
+                            // timeout says nothing about the PTY peer.
+                            if matches!(transport, ConsoleTransport::Pty(_)) && !was_backlogged {
                                 // This very specific case happens when the serial is connected
                                 // to a PTY. We know EPOLLHUP is always present when there's nothing
                                 // connected at the other end of the PTY. That's why getting no event
@@ -399,7 +458,22 @@ impl SerialManager {
                                         || matches!(transport, ConsoleTransport::TcpListen(_))
                                             && event.events & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0
                                     {
-                                        let mut input = [0u8; 64];
+                                        if !backlog.is_empty() {
+                                            // A new socket client starts with its fd enabled.
+                                            if event.events & libc::EPOLLIN as u32 != 0
+                                                && let Some(fd) = Self::input_fd(
+                                                    &transport,
+                                                    socket_console.as_ref(),
+                                                )
+                                            {
+                                                Self::set_input_enabled(
+                                                    epoll_fd.as_raw_fd(),
+                                                    fd,
+                                                    false,
+                                                )?;
+                                            }
+                                            continue;
+                                        }
                                         let count = match &transport {
                                             ConsoleTransport::Socket(_)
                                             | ConsoleTransport::TcpListen(_) => {
@@ -457,12 +531,24 @@ impl SerialManager {
                                             input[0] = 0x0d;
                                         }
 
-                                        serial
+                                        let queued = serial
                                             .as_ref()
                                             .lock()
                                             .unwrap()
                                             .queue_input_bytes(&input[..count])
                                             .map_err(Error::QueueInput)?;
+                                        if queued < count {
+                                            backlog = queued..count;
+                                            if let Some(fd) =
+                                                Self::input_fd(&transport, socket_console.as_ref())
+                                            {
+                                                Self::set_input_enabled(
+                                                    epoll_fd.as_raw_fd(),
+                                                    fd,
+                                                    false,
+                                                )?;
+                                            }
+                                        }
                                     }
                                     if matches!(transport, ConsoleTransport::TcpListen(_)) {
                                         continue;
