@@ -4092,6 +4092,7 @@ impl DeviceManager {
                         .map_err(DeviceManagerError::EventFd)?,
                     state_from_id(snapshot, id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
+                    self.memory_manager.lock().unwrap().cow_restored(),
                 )
                 .map_err(DeviceManagerError::CreateVirtioBalloon)?,
             ));
