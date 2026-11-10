@@ -549,6 +549,15 @@ impl BalloonEpollHandler {
         }
         for address in addresses.iter() {
             let chunk = address.0 / COW_REMAP_SIZE;
+            let base = GuestAddress(chunk * COW_REMAP_SIZE);
+            let Some(region) = memory.find_region(base) else {
+                continue;
+            };
+            if base.0 + COW_REMAP_SIZE > region.start_addr().0 + region.len()
+                || region.flags() & libc::MAP_SHARED != 0
+            {
+                continue;
+            }
             let page = (address.0 % COW_REMAP_SIZE) as usize / VIRTIO_BALLOON_PAGE_SIZE;
             let bits = self.inflated_chunks.entry(chunk).or_default();
             bits[page / 64] |= 1 << (page % 64);
@@ -556,13 +565,6 @@ impl BalloonEpollHandler {
                 continue;
             }
             self.inflated_chunks.remove(&chunk);
-            let base = GuestAddress(chunk * COW_REMAP_SIZE);
-            let Some(region) = memory.find_region(base) else {
-                continue;
-            };
-            if base.0 + COW_REMAP_SIZE > region.start_addr().0 + region.len() {
-                continue;
-            }
             if let Err(e) = Self::remap_anonymous_range(
                 memory,
                 base,
@@ -1566,10 +1568,34 @@ mod tests {
             BalloonStatsState::WaitingForInitialDescriptor,
         );
 
-        inflate_pfns(&mut handler, &memory, first..first + 512);
+        inflate_pfns(&mut handler, &memory, first..first + 256);
 
         assert!(handler.inflated_chunks.is_empty());
         assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0x5a);
+    }
+
+    #[test]
+    fn inflate_tracks_nothing_outside_guest_ram() {
+        if get_page_size() as usize != VIRTIO_BALLOON_PAGE_SIZE {
+            return;
+        }
+        let chunk = COW_REMAP_SIZE;
+        let pages_per_chunk = chunk >> VIRTIO_BALLOON_PFN_SHIFT;
+        let (memory, _backing_file) = cow_restored_memory(3 * chunk);
+        let mut handler = create_stats_handler(
+            &memory,
+            Queue::new(16).unwrap(),
+            BalloonStatsState::WaitingForInitialDescriptor,
+        );
+        handler.cow_restored = true;
+
+        inflate_pfns(
+            &mut handler,
+            &memory,
+            (4..260).map(|index| index * pages_per_chunk),
+        );
+
+        assert!(handler.inflated_chunks.is_empty());
     }
 
     #[test]
