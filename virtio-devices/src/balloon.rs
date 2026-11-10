@@ -453,7 +453,7 @@ impl BalloonEpollHandler {
             if let Err(e) =
                 Self::advise_memory_range(memory, GuestAddress(remap_start), remap_len, advice)
             {
-                warn!("Failed to madvise remapped memory at GPA 0x{remap_start:x}: {e}");
+                warn!("Failed to madvise remapped memory at GPA 0x{remap_start:x}: {e:?}");
             }
         }
         Ok(())
