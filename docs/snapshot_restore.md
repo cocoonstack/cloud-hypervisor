@@ -212,8 +212,10 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   (`mergeable=on`), `--pvmemcontrol`, device passthrough
   (`--device`/`--user-device`/`--vdpa`), and snapshot ranges that are not
   page-aligned single-region extents. Each region's `reserve` policy is
-  re-applied to the mapped region. THP is not: a private copy of a file page
-  is always 4 KiB, so `MADV_HUGEPAGE` would only enlarge read-around.
+  re-applied to the mapped region. THP is not. A private copy of a file page
+  is always 4 KiB. On a filesystem with large folios, `MADV_HUGEPAGE` would let
+  read faults map 2 MiB file folios, but it also makes each fault read about
+  4 MiB from the snapshot file, which slows down the restore.
 - A snapshot memory file shorter than the saved ranges is rejected up front (it
   would otherwise fault `SIGBUS` at run time).
 - `prefault` is rejected.
