@@ -76,6 +76,9 @@ const VIRTIO_BALLOON_PAGE_SIZE: usize = 1 << VIRTIO_BALLOON_PFN_SHIFT;
 // Batch the number of PFNs handled in one pass
 const VIRTIO_BALLOON_PFNS_PER_BATCH: usize = 256;
 
+// Granularity at which released copy-on-write memory is remapped anonymous.
+const COW_REMAP_SIZE: u64 = 2 << 20;
+
 // Enable statistics virtqueue.
 const VIRTIO_BALLOON_F_STATS_VQ: u64 = 1;
 // Deflate balloon on OOM
@@ -296,6 +299,7 @@ struct BalloonEpollHandler {
     pause_evt: EventFd,
     pbp: Option<PartiallyBalloonedPage>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
+    cow_overlay: bool,
 }
 
 impl BalloonEpollHandler {
@@ -331,6 +335,7 @@ impl BalloonEpollHandler {
         memory: &GuestMemory,
         range_base: GuestAddress,
         range_len: usize,
+        cow_overlay: bool,
     ) -> result::Result<(), Error> {
         let region = memory.find_region(range_base).ok_or(Error::GuestMemory(
             GuestMemoryError::InvalidGuestAddress(range_base),
@@ -372,15 +377,89 @@ impl BalloonEpollHandler {
             } else {
                 Ok(())
             }
+        } else if cow_overlay {
+            Self::remap_anonymous_range(
+                memory,
+                range_base,
+                len,
+                region.flags() & libc::MAP_NORESERVE,
+            )
         } else {
             Self::advise_memory_range(memory, range_base, len as usize, libc::MADV_DONTNEED)
         }
+    }
+
+    // MADV_DONTNEED on a copy-on-write restored range refaults each page from
+    // the snapshot file, so map anonymous memory over its 2 MiB-aligned part.
+    fn remap_anonymous_range(
+        memory: &GuestMemory,
+        range_base: GuestAddress,
+        len: u64,
+        reserve_flag: libc::c_int,
+    ) -> result::Result<(), Error> {
+        let start = range_base.0;
+        let end = start + len;
+        let remap_start = start.next_multiple_of(COW_REMAP_SIZE).min(end);
+        let remap_end = (end - end % COW_REMAP_SIZE).max(remap_start);
+        for (base, len) in [(start, remap_start - start), (remap_end, end - remap_end)] {
+            if len != 0 {
+                Self::advise_memory_range(
+                    memory,
+                    GuestAddress(base),
+                    len as usize,
+                    libc::MADV_DONTNEED,
+                )?;
+            }
+        }
+        if remap_start == remap_end {
+            return Ok(());
+        }
+
+        let remap_len = (remap_end - remap_start) as usize;
+        let slice = memory
+            .get_slice(GuestAddress(remap_start), remap_len)
+            .map_err(Error::GuestMemory)?;
+        // SAFETY: the slice lies inside a live guest RAM mapping, and MAP_FIXED
+        // replaces exactly that window.
+        let addr = unsafe {
+            libc::mmap(
+                slice.ptr_guard_mut().as_ptr().cast(),
+                remap_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | reserve_flag,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            warn!(
+                "Failed to remap released memory at GPA 0x{remap_start:x}: {}",
+                io::Error::last_os_error()
+            );
+            return Self::advise_memory_range(
+                memory,
+                GuestAddress(remap_start),
+                remap_len,
+                libc::MADV_DONTNEED,
+            );
+        }
+        for advice in [libc::MADV_DONTDUMP, libc::MADV_NOHUGEPAGE] {
+            // SAFETY: addr and remap_len name the mapping installed above.
+            if unsafe { libc::madvise(addr, remap_len, advice) } != 0 {
+                warn!(
+                    "Failed to madvise remapped memory at GPA 0x{remap_start:x}: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        Ok(())
     }
 
     fn release_memory_range_partial_page(
         pbp: &mut Option<PartiallyBalloonedPage>,
         memory: &GuestMemory,
         range_base: GuestAddress,
+        cow_overlay: bool,
     ) -> result::Result<(), Error> {
         let page_size: u64 = get_page_size();
         if pbp.is_none() {
@@ -399,6 +478,7 @@ impl BalloonEpollHandler {
                 memory,
                 vm_memory::GuestAddress(pbp.as_ref().unwrap().addr),
                 page_size as usize,
+                cow_overlay,
             )?;
 
             pbp.as_mut().unwrap().reset();
@@ -416,9 +496,12 @@ impl BalloonEpollHandler {
         // if the host page size differs from that.
         if get_page_size() as usize != VIRTIO_BALLOON_PAGE_SIZE {
             for &address in addresses.iter() {
-                if let Err(e) =
-                    Self::release_memory_range_partial_page(&mut self.pbp, memory, address)
-                {
+                if let Err(e) = Self::release_memory_range_partial_page(
+                    &mut self.pbp,
+                    memory,
+                    address,
+                    self.cow_overlay,
+                ) {
                     warn!("Failed to release memory at address {:#x}: {e}", address.0);
                 }
             }
@@ -442,7 +525,9 @@ impl BalloonEpollHandler {
                 if previous_address.checked_add(VIRTIO_BALLOON_PAGE_SIZE as u64) == Some(address) {
                     range_len += VIRTIO_BALLOON_PAGE_SIZE;
                 } else {
-                    if let Err(e) = Self::release_memory_range(memory, range_base, range_len) {
+                    if let Err(e) =
+                        Self::release_memory_range(memory, range_base, range_len, self.cow_overlay)
+                    {
                         warn!("Failed to release ballooned memory range: {e}");
                     }
                     range_base = address;
@@ -451,7 +536,9 @@ impl BalloonEpollHandler {
                 previous_address = address;
             }
 
-            if let Err(e) = Self::release_memory_range(memory, range_base, range_len) {
+            if let Err(e) =
+                Self::release_memory_range(memory, range_base, range_len, self.cow_overlay)
+            {
                 warn!("Failed to release ballooned memory range: {e}");
             }
         }
@@ -652,6 +739,7 @@ impl BalloonEpollHandler {
                     desc_chain.memory(),
                     desc.addr(),
                     desc.len() as usize,
+                    self.cow_overlay,
                 ) {
                     warn!("Failed to release reported memory range: {e}");
                 }
@@ -812,6 +900,7 @@ pub struct Balloon {
     stats_request_evt: EventFd,
     stats_request_sender: Option<Sender<()>>,
     stats_cache: BalloonStatsCache,
+    cow_overlay: bool,
 }
 
 impl Balloon {
@@ -826,6 +915,7 @@ impl Balloon {
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         state: Option<BalloonState>,
+        cow_overlay: bool,
     ) -> io::Result<Self> {
         let mut queue_sizes = vec![QUEUE_SIZE; MIN_NUM_QUEUES as usize];
 
@@ -886,6 +976,7 @@ impl Balloon {
             stats_request_evt,
             stats_request_sender: None,
             stats_cache: Arc::new(Mutex::new(None)),
+            cow_overlay,
         })
     }
 
@@ -1068,6 +1159,7 @@ impl VirtioDevice for Balloon {
             pause_evt,
             pbp: None,
             access_platform: self.common.access_platform(),
+            cow_overlay: self.cow_overlay,
         };
 
         let pause_control = Arc::clone(&self.common.pause_control);
@@ -1179,6 +1271,7 @@ mod tests {
             pause_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
             pbp: None,
             access_platform: None,
+            cow_overlay: false,
         }
     }
 
@@ -1221,7 +1314,7 @@ mod tests {
         memory.write_slice(&[0xa5], GuestAddress(0)).unwrap();
         assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xa5);
 
-        let res = BalloonEpollHandler::release_memory_range(&memory, GuestAddress(0), 4096);
+        let res = BalloonEpollHandler::release_memory_range(&memory, GuestAddress(0), 4096, false);
         assert!(res.is_ok(), "release_memory_range failed: {res:?}");
         assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0x5a);
         assert_eq!(fs::read(backing_file.as_path()).unwrap(), original);
@@ -1237,6 +1330,79 @@ mod tests {
     fn release_private_page_does_not_modify_writable_backing_file() {
         // A writable descriptor does not make a MAP_PRIVATE mapping punchable.
         test_release_private_page(false);
+    }
+
+    #[test]
+    fn release_cow_overlay_remaps_aligned_part() {
+        use std::fs;
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        use vmm_sys_util::tempfile::TempFile;
+
+        let page = get_page_size();
+        let chunk = COW_REMAP_SIZE;
+        let size = 3 * chunk;
+        let memory = GuestMemory::from_ranges(&[(GuestAddress(0), size as usize)]).unwrap();
+
+        let backing_file = TempFile::new().unwrap();
+        backing_file
+            .as_file()
+            .write_all(&vec![0x5a; size as usize])
+            .unwrap();
+        let original = fs::read(backing_file.as_path()).unwrap();
+        let host = memory.get_host_address(GuestAddress(0)).unwrap();
+        // SAFETY: the window is the whole private anonymous region created above.
+        let ret = unsafe {
+            libc::mmap(
+                host.cast(),
+                size as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
+                backing_file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(ret, libc::MAP_FAILED);
+        for gpa in [0, page, chunk - page, chunk, 2 * chunk, 2 * chunk + page] {
+            memory.write_obj(0xa5u8, GuestAddress(gpa)).unwrap();
+        }
+
+        // Without the overlay flag, a released page reads the snapshot file again.
+        BalloonEpollHandler::release_memory_range(&memory, GuestAddress(chunk), 4096, false)
+            .unwrap();
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0x5a);
+        memory.write_obj(0xa5u8, GuestAddress(chunk)).unwrap();
+
+        let base = GuestAddress(page);
+        let len = (2 * chunk) as usize;
+        BalloonEpollHandler::release_memory_range(&memory, base, len, true).unwrap();
+
+        // Outside the range, the guest write stays.
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xa5);
+        assert_eq!(
+            memory
+                .read_obj::<u8>(GuestAddress(2 * chunk + page))
+                .unwrap(),
+            0xa5
+        );
+        // The unaligned head and tail fall back to the snapshot file.
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(page)).unwrap(), 0x5a);
+        assert_eq!(
+            memory.read_obj::<u8>(GuestAddress(chunk - page)).unwrap(),
+            0x5a
+        );
+        assert_eq!(
+            memory.read_obj::<u8>(GuestAddress(2 * chunk)).unwrap(),
+            0x5a
+        );
+        // The aligned chunk is anonymous memory and reads as zero.
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0);
+        assert_eq!(
+            memory.read_obj::<u8>(GuestAddress(2 * chunk - 1)).unwrap(),
+            0
+        );
+        assert_eq!(fs::read(backing_file.as_path()).unwrap(), original);
     }
 
     #[test]
@@ -1394,6 +1560,7 @@ mod tests {
             SeccompAction::Allow,
             EventFd::new(EFD_NONBLOCK).unwrap(),
             None,
+            false,
         )
         .unwrap();
 
@@ -1411,6 +1578,7 @@ mod tests {
             SeccompAction::Allow,
             EventFd::new(EFD_NONBLOCK).unwrap(),
             None,
+            false,
         )
         .unwrap();
         balloon.common.acked_features = 1u64 << VIRTIO_BALLOON_F_STATS_VQ;
@@ -1432,6 +1600,7 @@ mod tests {
             SeccompAction::Allow,
             EventFd::new(EFD_NONBLOCK).unwrap(),
             None,
+            false,
         )
         .unwrap();
         balloon.common.acked_features = 1u64 << VIRTIO_BALLOON_F_STATS_VQ;
@@ -1464,6 +1633,7 @@ mod tests {
             SeccompAction::Allow,
             EventFd::new(EFD_NONBLOCK).unwrap(),
             None,
+            false,
         )
         .unwrap();
         balloon.common.acked_features = 1u64 << VIRTIO_BALLOON_F_STATS_VQ;

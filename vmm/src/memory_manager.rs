@@ -277,6 +277,7 @@ pub struct MemoryManager {
     diff_snapshot_ranges: Option<MemoryRangeTable>,
     diff_count: u32,
     cow_source: Option<CowSource>,
+    cow_restored: bool,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -1051,6 +1052,7 @@ impl MemoryManager {
             )));
         }
         do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)?;
+        self.cow_restored = true;
         // Landlock applies after the restore, so the pagemap is opened here.
         self.cow_source = match PageMap::open() {
             Ok(pagemap) => Some(CowSource {
@@ -1396,6 +1398,11 @@ impl MemoryManager {
                 _ => {}
             }
         }
+    }
+
+    /// True when guest RAM is a copy-on-write mapping of the snapshot file.
+    pub fn cow_restored(&self) -> bool {
+        self.cow_restored
     }
 
     /// True while an on-demand (UFFD) restore is still faulting in guest RAM.
@@ -2300,6 +2307,7 @@ impl MemoryManager {
             diff_snapshot_ranges: None,
             diff_count: 0,
             cow_source: None,
+            cow_restored: false,
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
