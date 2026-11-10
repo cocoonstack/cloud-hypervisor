@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
@@ -77,6 +78,7 @@ const VIRTIO_BALLOON_PAGE_SIZE: usize = 1 << VIRTIO_BALLOON_PFN_SHIFT;
 const VIRTIO_BALLOON_PFNS_PER_BATCH: usize = 256;
 
 const COW_REMAP_SIZE: u64 = 2 << 20;
+const COW_CHUNK_WORDS: usize = COW_REMAP_SIZE as usize / VIRTIO_BALLOON_PAGE_SIZE / 64;
 
 // Enable statistics virtqueue.
 const VIRTIO_BALLOON_F_STATS_VQ: u64 = 1;
@@ -299,6 +301,7 @@ struct BalloonEpollHandler {
     pbp: Option<PartiallyBalloonedPage>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
     cow_restored: bool,
+    inflated_chunks: HashMap<u64, [u64; COW_CHUNK_WORDS]>,
 }
 
 impl BalloonEpollHandler {
@@ -540,6 +543,35 @@ impl BalloonEpollHandler {
                 warn!("Failed to release ballooned memory range: {e}");
             }
         }
+
+        if !self.cow_restored {
+            return;
+        }
+        for address in addresses.iter() {
+            let chunk = address.0 / COW_REMAP_SIZE;
+            let page = (address.0 % COW_REMAP_SIZE) as usize / VIRTIO_BALLOON_PAGE_SIZE;
+            let bits = self.inflated_chunks.entry(chunk).or_default();
+            bits[page / 64] |= 1 << (page % 64);
+            if bits.iter().any(|word| *word != u64::MAX) {
+                continue;
+            }
+            self.inflated_chunks.remove(&chunk);
+            let base = GuestAddress(chunk * COW_REMAP_SIZE);
+            let Some(region) = memory.find_region(base) else {
+                continue;
+            };
+            if base.0 + COW_REMAP_SIZE > region.start_addr().0 + region.len() {
+                continue;
+            }
+            if let Err(e) = Self::remap_anonymous_range(
+                memory,
+                base,
+                COW_REMAP_SIZE,
+                region.flags() & libc::MAP_NORESERVE,
+            ) {
+                warn!("Failed to remap inflated memory at GPA 0x{:x}: {e}", base.0);
+            }
+        }
     }
 
     fn process_queue(&mut self, queue_index: u16) -> result::Result<(), Error> {
@@ -598,7 +630,18 @@ impl BalloonEpollHandler {
                                 inflate_addresses.clear();
                             }
                         }
-                        DEFLATE_QUEUE => {} // Nothing to do on deflate
+                        DEFLATE_QUEUE => {
+                            let address = u64::from(pfn) << VIRTIO_BALLOON_PFN_SHIFT;
+                            let chunk = address / COW_REMAP_SIZE;
+                            if let Some(bits) = self.inflated_chunks.get_mut(&chunk) {
+                                let page =
+                                    (address % COW_REMAP_SIZE) as usize / VIRTIO_BALLOON_PAGE_SIZE;
+                                bits[page / 64] &= !(1 << (page % 64));
+                                if bits.iter().all(|word| *word == 0) {
+                                    self.inflated_chunks.remove(&chunk);
+                                }
+                            }
+                        }
                         _ => return Err(Error::InvalidQueueIndex(queue_index)),
                     }
                 }
@@ -1158,6 +1201,7 @@ impl VirtioDevice for Balloon {
             pbp: None,
             access_platform: self.common.access_platform(),
             cow_restored: self.cow_restored,
+            inflated_chunks: HashMap::new(),
         };
 
         let pause_control = Arc::clone(&self.common.pause_control);
@@ -1273,6 +1317,7 @@ mod tests {
             pbp: None,
             access_platform: None,
             cow_restored: false,
+            inflated_chunks: HashMap::new(),
         }
     }
 
@@ -1428,6 +1473,103 @@ mod tests {
         assert!(flags.split_whitespace().any(|f| f == "dd"), "{flags}");
         assert!(flags.split_whitespace().any(|f| f == "nh"), "{flags}");
         assert!(!vm_flags(host - 1).contains(" nh"));
+    }
+
+    fn inflate_pfns(
+        handler: &mut BalloonEpollHandler,
+        memory: &GuestMemory,
+        pfns: impl Iterator<Item = u64>,
+    ) {
+        let mut addresses: SmallVec<[GuestAddress; VIRTIO_BALLOON_PFNS_PER_BATCH]> = pfns
+            .map(|pfn| GuestAddress(pfn << VIRTIO_BALLOON_PFN_SHIFT))
+            .collect();
+        handler.process_inflate_addresses(memory, &mut addresses);
+    }
+
+    #[test]
+    fn inflate_remaps_full_cow_chunk_across_batches() {
+        if get_page_size() as usize != VIRTIO_BALLOON_PAGE_SIZE {
+            return;
+        }
+        let chunk = COW_REMAP_SIZE;
+        let first = chunk >> VIRTIO_BALLOON_PFN_SHIFT;
+        let (memory, _backing_file) = cow_restored_memory(3 * chunk);
+        memory.write_obj(0xa5u8, GuestAddress(chunk)).unwrap();
+        let mut handler = create_stats_handler(
+            &memory,
+            Queue::new(16).unwrap(),
+            BalloonStatsState::WaitingForInitialDescriptor,
+        );
+        handler.cow_restored = true;
+
+        inflate_pfns(&mut handler, &memory, first..first + 256);
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0x5a);
+        inflate_pfns(&mut handler, &memory, first + 256..first + 512);
+
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0);
+        let host = memory.get_host_address(GuestAddress(chunk)).unwrap() as u64;
+        assert!(vm_flags(host).split_whitespace().any(|f| f == "nh"));
+        assert!(handler.inflated_chunks.is_empty());
+    }
+
+    #[test]
+    fn inflate_keeps_cow_chunk_with_deflated_page() {
+        const QUEUE_ADDRESS: GuestAddress = GuestAddress(0x1_0000);
+        const PFNS_ADDRESS: GuestAddress = GuestAddress(0x2_0000);
+
+        if get_page_size() as usize != VIRTIO_BALLOON_PAGE_SIZE {
+            return;
+        }
+        let chunk = COW_REMAP_SIZE;
+        let first = chunk >> VIRTIO_BALLOON_PFN_SHIFT;
+        let (memory, _backing_file) = cow_restored_memory(3 * chunk);
+        let mut handler = create_stats_handler(
+            &memory,
+            Queue::new(16).unwrap(),
+            BalloonStatsState::WaitingForInitialDescriptor,
+        );
+        handler.cow_restored = true;
+        inflate_pfns(&mut handler, &memory, first..first + 256);
+
+        memory.write_obj(first as u32, PFNS_ADDRESS).unwrap();
+        let deflate_queue = VirtQueue::new(QUEUE_ADDRESS, &memory, 16);
+        deflate_queue.dtable[0].set(PFNS_ADDRESS.0, size_of::<u32>() as u32, 0, 0);
+        deflate_queue.avail.ring[0].set(0);
+        deflate_queue.avail.idx.set(1);
+        handler.queues.push(deflate_queue.create_queue());
+        handler.process_queue(DEFLATE_QUEUE).unwrap();
+        memory.write_obj(0xa5u8, GuestAddress(chunk)).unwrap();
+
+        inflate_pfns(&mut handler, &memory, first + 256..first + 512);
+
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0xa5);
+        assert_eq!(
+            memory.read_obj::<u8>(GuestAddress(chunk + 4096)).unwrap(),
+            0x5a
+        );
+        let host = memory.get_host_address(GuestAddress(chunk)).unwrap() as u64;
+        assert!(!vm_flags(host).split_whitespace().any(|f| f == "nh"));
+        assert_eq!(handler.inflated_chunks.len(), 1);
+    }
+
+    #[test]
+    fn inflate_tracks_nothing_without_cow_restore() {
+        if get_page_size() as usize != VIRTIO_BALLOON_PAGE_SIZE {
+            return;
+        }
+        let chunk = COW_REMAP_SIZE;
+        let first = chunk >> VIRTIO_BALLOON_PFN_SHIFT;
+        let (memory, _backing_file) = cow_restored_memory(3 * chunk);
+        let mut handler = create_stats_handler(
+            &memory,
+            Queue::new(16).unwrap(),
+            BalloonStatsState::WaitingForInitialDescriptor,
+        );
+
+        inflate_pfns(&mut handler, &memory, first..first + 512);
+
+        assert!(handler.inflated_chunks.is_empty());
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0x5a);
     }
 
     #[test]
