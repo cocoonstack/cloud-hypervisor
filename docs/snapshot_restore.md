@@ -211,8 +211,9 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   `id`+`size` zone is fine), resizable RAM (`hotplug_size`, virtio-mem), KSM
   (`mergeable=on`), `--pvmemcontrol`, device passthrough
   (`--device`/`--user-device`/`--vdpa`), and snapshot ranges that are not
-  page-aligned single-region extents. Each region's `reserve` policy and the
-  THP policy are re-applied to the mapped region.
+  page-aligned single-region extents. Each region's `reserve` policy is
+  re-applied to the mapped region. THP is not: a private copy of a file page
+  is always 4 KiB, so `MADV_HUGEPAGE` would only enlarge read-around.
 - A snapshot memory file shorter than the saved ranges is rejected up front (it
   would otherwise fault `SIGBUS` at run time).
 - `prefault` is rejected.
