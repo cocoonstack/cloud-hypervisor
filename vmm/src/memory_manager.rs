@@ -1061,7 +1061,7 @@ impl MemoryManager {
                 "snapshot memory file is shorter than the saved ranges",
             )));
         }
-        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)?;
+        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions)?;
         self.cow_restored = true;
         // Landlock applies after the restore, so the pagemap is opened here.
         self.cow_source = match PageMap::open() {
@@ -4087,13 +4087,11 @@ fn is_restore_cow_compatible(guest_memory: &GuestMemory, saved_regions: &MemoryR
 }
 
 // Maps each saved range over its guest RAM window, re-applying the owning
-// region's reserve policy and the THP policy. Ranges must have passed
-// `is_restore_cow_compatible`.
+// region's reserve policy. Ranges must have passed `is_restore_cow_compatible`.
 fn do_mmap_cow_saved_regions(
     guest_memory: &GuestMemory,
     memory_file: &File,
     saved_regions: &MemoryRangeTable,
-    thp: bool,
 ) -> Result<(), Error> {
     let mut file_offset: u64 = 0;
     for range in saved_regions.ranges() {
@@ -4125,16 +4123,6 @@ fn do_mmap_cow_saved_regions(
         };
         if ret == libc::MAP_FAILED {
             return Err(Error::SnapshotMmap(io::Error::last_os_error()));
-        }
-        if thp {
-            // SAFETY: ret/length name the private mapping just installed above.
-            let adv = unsafe { libc::madvise(ret, length, libc::MADV_HUGEPAGE) };
-            if adv != 0 {
-                warn!(
-                    "Restore (mode=copyonwrite): MADV_HUGEPAGE failed: {}",
-                    io::Error::last_os_error()
-                );
-            }
         }
         file_offset = file_offset.checked_add(range.length).ok_or_else(|| {
             Error::SnapshotMmap(io::Error::other("snapshot range file offset overflow"))
@@ -4383,7 +4371,7 @@ mod tests {
         });
 
         assert!(is_restore_cow_compatible(&gm, &table));
-        do_mmap_cow_saved_regions(&gm, &file, &table, false).unwrap();
+        do_mmap_cow_saved_regions(&gm, &file, &table).unwrap();
 
         assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xab);
         assert_eq!(gm.read_obj::<u8>(GuestAddress(page - 1)).unwrap(), 0xab);
@@ -4411,7 +4399,7 @@ mod tests {
             gpa: 0,
             length: 16 * page,
         });
-        do_mmap_cow_saved_regions(&gm, &file, &ranges, false).unwrap();
+        do_mmap_cow_saved_regions(&gm, &file, &ranges).unwrap();
         let source = CowSource {
             file,
             ranges,
@@ -4484,7 +4472,7 @@ mod tests {
     }
 
     #[test]
-    fn cow_restore_honors_region_reserve_and_thp() {
+    fn cow_restore_honors_region_reserve() {
         let page = get_page_size();
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&vec![0xcdu8; page as usize]).unwrap();
@@ -4509,7 +4497,7 @@ mod tests {
                 gpa: 0,
                 length: page,
             });
-            do_mmap_cow_saved_regions(&gm, &file, &table, true).unwrap();
+            do_mmap_cow_saved_regions(&gm, &file, &table).unwrap();
             assert_eq!(gm.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xcd);
         }
     }
