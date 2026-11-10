@@ -1313,6 +1313,9 @@ impl vm::Vm for KvmVm {
             }
         }
         for vcpu in vcpus {
+            // The pause notification does not survive a snapshot, so repeat it.
+            vcpu.notify_guest_clock_paused()
+                .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?;
             let mut msrs = vec![
                 MsrEntry {
                     index: msr_index::MSR_IA32_TSC,
