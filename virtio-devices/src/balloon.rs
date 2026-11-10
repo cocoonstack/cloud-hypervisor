@@ -298,7 +298,7 @@ struct BalloonEpollHandler {
     pause_evt: EventFd,
     pbp: Option<PartiallyBalloonedPage>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
-    cow_overlay: bool,
+    cow_restored: bool,
 }
 
 impl BalloonEpollHandler {
@@ -334,7 +334,7 @@ impl BalloonEpollHandler {
         memory: &GuestMemory,
         range_base: GuestAddress,
         range_len: usize,
-        cow_overlay: bool,
+        cow_restored: bool,
     ) -> result::Result<(), Error> {
         let region = memory.find_region(range_base).ok_or(Error::GuestMemory(
             GuestMemoryError::InvalidGuestAddress(range_base),
@@ -376,7 +376,7 @@ impl BalloonEpollHandler {
             } else {
                 Ok(())
             }
-        } else if cow_overlay {
+        } else if cow_restored {
             Self::remap_anonymous_range(
                 memory,
                 range_base,
@@ -399,12 +399,12 @@ impl BalloonEpollHandler {
         let end = start + len;
         let remap_start = start.next_multiple_of(COW_REMAP_SIZE).min(end);
         let remap_end = (end - end % COW_REMAP_SIZE).max(remap_start);
-        for (base, len) in [(start, remap_start - start), (remap_end, end - remap_end)] {
-            if len != 0 {
+        for (base, part) in [(start, remap_start - start), (remap_end, end - remap_end)] {
+            if part != 0 {
                 Self::advise_memory_range(
                     memory,
                     GuestAddress(base),
-                    len as usize,
+                    part as usize,
                     libc::MADV_DONTNEED,
                 )?;
             }
@@ -457,7 +457,7 @@ impl BalloonEpollHandler {
         pbp: &mut Option<PartiallyBalloonedPage>,
         memory: &GuestMemory,
         range_base: GuestAddress,
-        cow_overlay: bool,
+        cow_restored: bool,
     ) -> result::Result<(), Error> {
         let page_size: u64 = get_page_size();
         if pbp.is_none() {
@@ -476,7 +476,7 @@ impl BalloonEpollHandler {
                 memory,
                 vm_memory::GuestAddress(pbp.as_ref().unwrap().addr),
                 page_size as usize,
-                cow_overlay,
+                cow_restored,
             )?;
 
             pbp.as_mut().unwrap().reset();
@@ -498,7 +498,7 @@ impl BalloonEpollHandler {
                     &mut self.pbp,
                     memory,
                     address,
-                    self.cow_overlay,
+                    self.cow_restored,
                 ) {
                     warn!("Failed to release memory at address {:#x}: {e}", address.0);
                 }
@@ -524,7 +524,7 @@ impl BalloonEpollHandler {
                     range_len += VIRTIO_BALLOON_PAGE_SIZE;
                 } else {
                     if let Err(e) =
-                        Self::release_memory_range(memory, range_base, range_len, self.cow_overlay)
+                        Self::release_memory_range(memory, range_base, range_len, self.cow_restored)
                     {
                         warn!("Failed to release ballooned memory range: {e}");
                     }
@@ -535,7 +535,7 @@ impl BalloonEpollHandler {
             }
 
             if let Err(e) =
-                Self::release_memory_range(memory, range_base, range_len, self.cow_overlay)
+                Self::release_memory_range(memory, range_base, range_len, self.cow_restored)
             {
                 warn!("Failed to release ballooned memory range: {e}");
             }
@@ -737,7 +737,7 @@ impl BalloonEpollHandler {
                     desc_chain.memory(),
                     desc.addr(),
                     desc.len() as usize,
-                    self.cow_overlay,
+                    self.cow_restored,
                 ) {
                     warn!("Failed to release reported memory range: {e}");
                 }
@@ -898,7 +898,7 @@ pub struct Balloon {
     stats_request_evt: EventFd,
     stats_request_sender: Option<Sender<()>>,
     stats_cache: BalloonStatsCache,
-    cow_overlay: bool,
+    cow_restored: bool,
 }
 
 impl Balloon {
@@ -913,7 +913,7 @@ impl Balloon {
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         state: Option<BalloonState>,
-        cow_overlay: bool,
+        cow_restored: bool,
     ) -> io::Result<Self> {
         let mut queue_sizes = vec![QUEUE_SIZE; MIN_NUM_QUEUES as usize];
 
@@ -974,7 +974,7 @@ impl Balloon {
             stats_request_evt,
             stats_request_sender: None,
             stats_cache: Arc::new(Mutex::new(None)),
-            cow_overlay,
+            cow_restored,
         })
     }
 
@@ -1157,7 +1157,7 @@ impl VirtioDevice for Balloon {
             pause_evt,
             pbp: None,
             access_platform: self.common.access_platform(),
-            cow_overlay: self.cow_overlay,
+            cow_restored: self.cow_restored,
         };
 
         let pause_control = Arc::clone(&self.common.pause_control);
@@ -1219,7 +1219,10 @@ impl Migratable for Balloon {}
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use vm_virtio::queue::testing::VirtQueue;
+    use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
 
@@ -1269,7 +1272,7 @@ mod tests {
             pause_evt: EventFd::new(EFD_NONBLOCK).unwrap(),
             pbp: None,
             access_platform: None,
-            cow_overlay: false,
+            cow_restored: false,
         }
     }
 
@@ -1330,25 +1333,16 @@ mod tests {
         test_release_private_page(false);
     }
 
-    #[test]
-    fn release_cow_overlay_remaps_aligned_part() {
-        use std::fs;
+    fn cow_restored_memory(size: u64) -> (GuestMemory, TempFile) {
         use std::io::Write;
         use std::os::unix::io::AsRawFd;
 
-        use vmm_sys_util::tempfile::TempFile;
-
-        let page = get_page_size();
-        let chunk = COW_REMAP_SIZE;
-        let size = 3 * chunk;
         let memory = GuestMemory::from_ranges(&[(GuestAddress(0), size as usize)]).unwrap();
-
         let backing_file = TempFile::new().unwrap();
         backing_file
             .as_file()
             .write_all(&vec![0x5a; size as usize])
             .unwrap();
-        let original = fs::read(backing_file.as_path()).unwrap();
         let host = memory.get_host_address(GuestAddress(0)).unwrap();
         // SAFETY: the window is the whole private anonymous region created above.
         let ret = unsafe {
@@ -1362,6 +1356,32 @@ mod tests {
             )
         };
         assert_ne!(ret, libc::MAP_FAILED);
+        (memory, backing_file)
+    }
+
+    fn vm_flags(addr: u64) -> String {
+        let smaps = fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut inside = false;
+        for line in smaps.lines() {
+            if let Some((range, _)) = line.split_once(' ')
+                && let Some((start, end)) = range.split_once('-')
+                && let (Ok(start), Ok(end)) =
+                    (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
+            {
+                inside = (start..end).contains(&addr);
+            } else if inside && let Some(flags) = line.strip_prefix("VmFlags:") {
+                return flags.to_string();
+            }
+        }
+        panic!("no mapping at {addr:#x}");
+    }
+
+    #[test]
+    fn release_cow_restored_remaps_aligned_part() {
+        let page = get_page_size();
+        let chunk = COW_REMAP_SIZE;
+        let (memory, backing_file) = cow_restored_memory(3 * chunk);
+        let original = fs::read(backing_file.as_path()).unwrap();
         for gpa in [0, page, chunk - page, chunk, 2 * chunk, 2 * chunk + page] {
             memory.write_obj(0xa5u8, GuestAddress(gpa)).unwrap();
         }
@@ -1371,32 +1391,43 @@ mod tests {
         assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0x5a);
         memory.write_obj(0xa5u8, GuestAddress(chunk)).unwrap();
 
-        let base = GuestAddress(page);
         let len = (2 * chunk) as usize;
-        BalloonEpollHandler::release_memory_range(&memory, base, len, true).unwrap();
+        BalloonEpollHandler::release_memory_range(&memory, GuestAddress(page), len, true).unwrap();
 
-        assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xa5);
-        assert_eq!(
-            memory
-                .read_obj::<u8>(GuestAddress(2 * chunk + page))
-                .unwrap(),
-            0xa5
-        );
-        assert_eq!(memory.read_obj::<u8>(GuestAddress(page)).unwrap(), 0x5a);
-        assert_eq!(
-            memory.read_obj::<u8>(GuestAddress(chunk - page)).unwrap(),
-            0x5a
-        );
-        assert_eq!(
-            memory.read_obj::<u8>(GuestAddress(2 * chunk)).unwrap(),
-            0x5a
-        );
-        assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0);
-        assert_eq!(
-            memory.read_obj::<u8>(GuestAddress(2 * chunk - 1)).unwrap(),
-            0
-        );
+        for (gpa, value) in [
+            (0, 0xa5),
+            (2 * chunk + page, 0xa5),
+            (page, 0x5a),
+            (chunk - page, 0x5a),
+            (2 * chunk, 0x5a),
+            (chunk, 0),
+            (2 * chunk - 1, 0),
+        ] {
+            assert_eq!(memory.read_obj::<u8>(GuestAddress(gpa)).unwrap(), value);
+        }
         assert_eq!(fs::read(backing_file.as_path()).unwrap(), original);
+    }
+
+    #[test]
+    fn release_cow_restored_aligned_range_is_anonymous() {
+        let chunk = COW_REMAP_SIZE;
+        let (memory, _backing_file) = cow_restored_memory(3 * chunk);
+        memory.write_obj(0xa5u8, GuestAddress(chunk)).unwrap();
+
+        BalloonEpollHandler::release_memory_range(
+            &memory,
+            GuestAddress(chunk),
+            chunk as usize,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0);
+        let host = memory.get_host_address(GuestAddress(chunk)).unwrap() as u64;
+        let flags = vm_flags(host);
+        assert!(flags.split_whitespace().any(|f| f == "dd"), "{flags}");
+        assert!(flags.split_whitespace().any(|f| f == "nh"), "{flags}");
+        assert!(!vm_flags(host - 1).contains(" nh"));
     }
 
     #[test]
