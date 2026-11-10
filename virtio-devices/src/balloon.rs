@@ -76,7 +76,6 @@ const VIRTIO_BALLOON_PAGE_SIZE: usize = 1 << VIRTIO_BALLOON_PFN_SHIFT;
 // Batch the number of PFNs handled in one pass
 const VIRTIO_BALLOON_PFNS_PER_BATCH: usize = 256;
 
-// Granularity at which released copy-on-write memory is remapped anonymous.
 const COW_REMAP_SIZE: u64 = 2 << 20;
 
 // Enable statistics virtqueue.
@@ -389,8 +388,7 @@ impl BalloonEpollHandler {
         }
     }
 
-    // MADV_DONTNEED on a copy-on-write restored range refaults each page from
-    // the snapshot file, so map anonymous memory over its 2 MiB-aligned part.
+    // DONTNEED would refault copy-on-write pages from the snapshot file.
     fn remap_anonymous_range(
         memory: &GuestMemory,
         range_base: GuestAddress,
@@ -1368,7 +1366,6 @@ mod tests {
             memory.write_obj(0xa5u8, GuestAddress(gpa)).unwrap();
         }
 
-        // Without the overlay flag, a released page reads the snapshot file again.
         BalloonEpollHandler::release_memory_range(&memory, GuestAddress(chunk), 4096, false)
             .unwrap();
         assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0x5a);
@@ -1378,7 +1375,6 @@ mod tests {
         let len = (2 * chunk) as usize;
         BalloonEpollHandler::release_memory_range(&memory, base, len, true).unwrap();
 
-        // Outside the range, the guest write stays.
         assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xa5);
         assert_eq!(
             memory
@@ -1386,7 +1382,6 @@ mod tests {
                 .unwrap(),
             0xa5
         );
-        // The unaligned head and tail fall back to the snapshot file.
         assert_eq!(memory.read_obj::<u8>(GuestAddress(page)).unwrap(), 0x5a);
         assert_eq!(
             memory.read_obj::<u8>(GuestAddress(chunk - page)).unwrap(),
@@ -1396,7 +1391,6 @@ mod tests {
             memory.read_obj::<u8>(GuestAddress(2 * chunk)).unwrap(),
             0x5a
         );
-        // The aligned chunk is anonymous memory and reads as zero.
         assert_eq!(memory.read_obj::<u8>(GuestAddress(chunk)).unwrap(), 0);
         assert_eq!(
             memory.read_obj::<u8>(GuestAddress(2 * chunk - 1)).unwrap(),
