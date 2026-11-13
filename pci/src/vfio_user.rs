@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::os::unix::prelude::AsRawFd;
 use std::sync::{Arc, Barrier, Mutex};
-use std::{io, result};
+use std::{io, process, result};
 
 use log::{error, info};
 use thiserror::Error;
@@ -440,25 +440,41 @@ impl PciDevice for VfioUserPciDevice {
                     Ok(new_address)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            for (user_memory_region, new_address) in mmio_region
-                .user_memory_regions
-                .iter_mut()
-                .zip(new_addresses)
-            {
-                user_memory_region.move_region(new_address)?;
-                user_memory_region
-                    .mapping
-                    .lock()
-                    .unwrap()
-                    .register()
-                    .map_err(io::Error::other)?;
+            for (i, &new_address) in new_addresses.iter().enumerate() {
+                let user_memory_region = &mut mmio_region.user_memory_regions[i];
+                let result = user_memory_region.move_region(new_address).and_then(|()| {
+                    user_memory_region
+                        .mapping
+                        .lock()
+                        .unwrap()
+                        .register()
+                        .map_err(io::Error::other)
+                });
+                if let Err(e) = result {
+                    // The caller gives the range back, so no area may stay mapped there.
+                    for user_memory_region in &mut mmio_region.user_memory_regions[..=i] {
+                        let unwind = user_memory_region
+                            .mapping
+                            .lock()
+                            .unwrap()
+                            .unregister()
+                            .map_err(io::Error::other);
+                        let unwind = unwind.and_then(|()| {
+                            user_memory_region.move_region(old_base + user_memory_region.offset)
+                        });
+                        if let Err(unwind) = unwind {
+                            error!("FATAL: Failed to unwind BAR install: {unwind}");
+                            process::exit(1);
+                        }
+                    }
+                    return Err(e);
+                }
             }
             mmio_region.start = GuestAddress(new_base);
             info!("Moved bar 0x{old_base:x} -> 0x{new_base:x}");
         }
         Ok(())
     }
-
     fn is_bar_released(&self, bar_idx: usize) -> bool {
         self.common.configuration.is_bar_released(bar_idx)
     }

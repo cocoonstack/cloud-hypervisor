@@ -2809,6 +2809,7 @@ impl PciDevice for VfioPciDevice {
             if region.index as usize != bar_idx {
                 continue;
             }
+            let old_base = region.start.raw_value();
             let map_p2p = self.p2p_dma && region.is_p2p_mappable();
             let new_addresses = region
                 .user_memory_regions
@@ -2823,35 +2824,56 @@ impl PciDevice for VfioPciDevice {
                     Ok(new_address)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            for (user_memory_region, new_address) in
-                region.user_memory_regions.iter_mut().zip(new_addresses)
-            {
-                user_memory_region.move_region(new_address)?;
-                user_memory_region
-                    .mapping
-                    .lock()
-                    .unwrap()
-                    .register()
-                    .map_err(io::Error::other)?;
-                if map_p2p {
-                    let offset = user_memory_region.offset;
+            for (i, &new_address) in new_addresses.iter().enumerate() {
+                let user_memory_region = &mut region.user_memory_regions[i];
+                let result = (|| {
+                    user_memory_region.move_region(new_address)?;
                     user_memory_region
-                        .map_for_p2p(
-                            &self.device,
-                            &self.vfio_ops,
-                            &self.device_path,
-                            self.bdf,
-                            region.index,
-                            offset,
-                        )
+                        .mapping
+                        .lock()
+                        .unwrap()
+                        .register()
                         .map_err(io::Error::other)?;
+                    if map_p2p {
+                        let offset = user_memory_region.offset;
+                        user_memory_region
+                            .map_for_p2p(
+                                &self.device,
+                                &self.vfio_ops,
+                                &self.device_path,
+                                self.bdf,
+                                region.index,
+                                offset,
+                            )
+                            .map_err(io::Error::other)?;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = result {
+                    // The caller gives the range back, so no area may stay mapped there.
+                    for user_memory_region in &mut region.user_memory_regions[..=i] {
+                        let unwind: io::Result<()> = (|| {
+                            user_memory_region.unmap_p2p(self.vfio_ops.as_ref())?;
+                            user_memory_region
+                                .mapping
+                                .lock()
+                                .unwrap()
+                                .unregister()
+                                .map_err(io::Error::other)?;
+                            user_memory_region.move_region(old_base + user_memory_region.offset)
+                        })();
+                        if let Err(unwind) = unwind {
+                            error!("FATAL: Failed to unwind BAR install: {unwind}");
+                            process::exit(1);
+                        }
+                    }
+                    return Err(e);
                 }
             }
             region.start = GuestAddress(new_base);
         }
         Ok(())
     }
-
     fn is_bar_released(&self, bar_idx: usize) -> bool {
         self.common.configuration.is_bar_released(bar_idx)
     }
