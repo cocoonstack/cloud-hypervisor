@@ -112,7 +112,8 @@ use vfio_ioctls::VfioIommufd;
 use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd, VfioOps};
 use virtio_devices::block::Error as VirtioBlockError;
 use virtio_devices::transport::{
-    VIRTIO_CONFIG_BAR_INDEX, VirtioPciDevice, VirtioPciDeviceActivator, VirtioTransport,
+    VIRTIO_CONFIG_BAR_INDEX, VIRTIO_SHM_BAR_INDEX, VirtioPciDevice, VirtioPciDeviceActivator,
+    VirtioTransport,
 };
 use virtio_devices::vhost_user::{PostcopyHandler, VhostUserConfig};
 use virtio_devices::{
@@ -318,6 +319,10 @@ pub enum DeviceManagerError {
     /// Cannot allocate PCI BARs
     #[error("Cannot allocate PCI BARs")]
     AllocateBars(#[source] pci::PciDeviceError),
+
+    /// Failed leaving a released BAR unmapped
+    #[error("Failed leaving a released BAR unmapped")]
+    UnmapReleasedBar(#[source] io::Error),
 
     /// Could not free the BARs associated with a PCI device.
     #[error("Could not free the BARs associated with a PCI device")]
@@ -4849,6 +4854,25 @@ impl DeviceManager {
         segment_id: u16,
         resources: Option<Vec<Resource>>,
     ) -> DeviceManagerResult<(Vec<PciBarConfiguration>, Vec<Resource>)> {
+        // On restore, a BAR whose space is not decoded is left unmapped: the
+        // device marks it released here, before anything is allocated or
+        // mapped, so that allocate_bars() leaves its saved range alone, which
+        // another device may hold by now, and the creation path skips the
+        // rest. The configuration reads as mapped until this point, so a
+        // device that writes its own COMMAND register at creation (pvpanic)
+        // plans nothing.
+        let mut released = Vec::new();
+        if let Some(resources) = &resources {
+            let mut device = pci_device.lock().unwrap();
+            for resource in resources {
+                if let Resource::PciBar { index, base, .. } = resource
+                    && device.release_stale_bar(*index, *base)
+                {
+                    released.push(*index);
+                }
+            }
+        }
+
         let bars = pci_device
             .lock()
             .unwrap()
@@ -4877,7 +4901,52 @@ impl DeviceManager {
             });
         }
 
+        if !released.is_empty() {
+            let mut device = pci_device.lock().unwrap();
+            for bar in bars.iter().filter(|bar| released.contains(&bar.idx())) {
+                self.unmap_released_bar(&mut *device, segment_id, bar)
+                    .map_err(DeviceManagerError::UnmapReleasedBar)?;
+            }
+        }
+
         Ok((bars, new_resources))
+    }
+
+    /// Give back what a virtio device set up for its shared memory BAR when
+    /// it was created, before the BAR was marked released: its allocator
+    /// range and its memory region. The other BARs of a released device are
+    /// not allocated or mapped in the first place.
+    fn unmap_released_bar(
+        &self,
+        pci_device: &mut dyn PciDevice,
+        segment_id: u16,
+        bar: &PciBarConfiguration,
+    ) -> result::Result<(), io::Error> {
+        if bar.idx() == VIRTIO_SHM_BAR_INDEX
+            && let Some(virtio_pci_dev) = pci_device.as_any_mut().downcast_ref::<VirtioPciDevice>()
+        {
+            self.address_manager.allocator_free(
+                segment_id as usize,
+                bar.addr(),
+                bar.size(),
+                bar.region_type(),
+            );
+            if let Some(shm_regions) = virtio_pci_dev
+                .virtio_device()
+                .lock()
+                .unwrap()
+                .get_shm_regions()
+            {
+                shm_regions
+                    .mapping
+                    .lock()
+                    .unwrap()
+                    .unregister()
+                    .map_err(io::Error::other)?;
+            }
+        }
+
+        Ok(())
     }
 
     #[expect(clippy::needless_pass_by_value)]
@@ -4891,7 +4960,15 @@ impl DeviceManager {
     ) -> DeviceManagerResult<()> {
         self.bus_devices.push(Arc::clone(&bus_device));
 
-        self.register_bar_mapping(Arc::clone(&bus_device), &bars)?;
+        // A BAR the device marked released on restore stays off the bus.
+        let mapped: Vec<PciBarConfiguration> = {
+            let device = pci_device.lock().unwrap();
+            bars.iter()
+                .filter(|bar| !device.is_bar_released(bar.idx()))
+                .copied()
+                .collect()
+        };
+        self.register_bar_mapping(Arc::clone(&bus_device), &mapped)?;
 
         self.pci_segments[segment_id as usize]
             .pci_bus
@@ -5239,12 +5316,20 @@ impl DeviceManager {
             .find(|bar| bar.idx() == VIRTIO_CONFIG_BAR_INDEX)
             .unwrap()
             .addr();
-        for (event, addr) in virtio_pci_device.lock().unwrap().ioeventfds(bar_addr) {
-            let io_addr = IoEventAddress::Mmio(addr);
-            self.address_manager
-                .vm
-                .register_ioevent(event, &io_addr, None)
-                .map_err(DeviceManagerError::RegisterIoevent)?;
+        // A config BAR left unmapped on restore gets its ioeventfds when it
+        // is installed.
+        if !virtio_pci_device
+            .lock()
+            .unwrap()
+            .is_bar_released(VIRTIO_CONFIG_BAR_INDEX)
+        {
+            for (event, addr) in virtio_pci_device.lock().unwrap().ioeventfds(bar_addr) {
+                let io_addr = IoEventAddress::Mmio(addr);
+                self.address_manager
+                    .vm
+                    .register_ioevent(event, &io_addr, None)
+                    .map_err(DeviceManagerError::RegisterIoevent)?;
+            }
         }
 
         // Update the device tree with correct resource information.
@@ -5376,9 +5461,16 @@ impl DeviceManager {
             hypervisor::MemoryVisibility::Shared,
         )
         .map_err(DeviceManagerError::RegisterGuestRegion)?;
-        region
-            .register()
-            .map_err(DeviceManagerError::RegisterGuestRegion)?;
+        // A data BAR left unmapped on restore is registered when installed.
+        if !ivshmem_device
+            .lock()
+            .unwrap()
+            .is_bar_released(IVSHMEM_DATA_BAR_IDX)
+        {
+            region
+                .register()
+                .map_err(DeviceManagerError::RegisterGuestRegion)?;
+        }
         ivshmem_device.lock().unwrap().set_region(region);
 
         let mut node = device_node!(id, ivshmem_device);
