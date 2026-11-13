@@ -2053,8 +2053,9 @@ impl VfioCommon {
                 // write_non_bar_config_register() so config patches, MSI/MSI-X
                 // updates, and shadow synchronization apply consistently, while
                 // ignoring writes to BAR registers to prevent guest BAR
-                // reprogramming via the mirror and avoiding draining
-                // pending_bar_reprogram where write_bar() cannot return it.
+                // reprogramming via the mirror. BAR releases and installs are
+                // left to the config space path, as write_bar() cannot return
+                // a relocation: pending installs stay pending.
                 let config_offset = offset - NVIDIA_BAR0_CONFIG_MIRROR_OFFSET;
                 let reg_idx = (config_offset / PCI_CONFIG_REGISTER_SIZE as u64) as usize;
                 let reg_off = config_offset % PCI_CONFIG_REGISTER_SIZE as u64;
@@ -2177,7 +2178,6 @@ impl VfioCommon {
         }
 
         let mut reloc = BarRelocation::default();
-        self.configuration.drain_pending_relocation(&mut reloc);
         if reg_idx == COMMAND_REG {
             self.configuration.drain_pending_installs(&mut reloc);
         }
@@ -4789,7 +4789,7 @@ mod tests {
     }
 
     #[test]
-    fn nvidia_bar0_config_mirror_command_reg_preserves_pending_bar_reprogram() {
+    fn nvidia_bar0_config_mirror_command_reg_preserves_pending_bar_installs() {
         let mock = MockNvidiaDevice::new();
         let mut common = test_vfio_common(Arc::clone(&mock), None);
         common.vendor_id = VENDOR_NVIDIA;
@@ -4820,14 +4820,15 @@ mod tests {
             assert!(!common.is_nvidia_bar0_command_reg_mirror(bar0_gpa, 0x80004));
         }
 
-        // Queue a pending BAR reprogramming while MSE is disabled.
+        // Move BAR0 while MSE is disabled: its install is pending.
         let new_bar0_gpa: u32 = 0xd000_0000;
-        let (reprogram, _) =
+        let (reloc, _) =
             common.write_config_register(PCI_CONFIG_BAR0_INDEX, 0, &new_bar0_gpa.to_le_bytes());
-        assert!(reprogram.is_empty());
+        assert_eq!(reloc.release.len(), 1);
+        assert!(reloc.install.is_empty());
 
         // Enabling MSE via the BAR0 config space mirror updates COMMAND_REG in
-        // hardware and shadow without silently draining pending_bar_reprogram.
+        // hardware and shadow, and leaves the install pending.
         let cmd = COMMAND_REG_MEMORY_SPACE_MASK as u16;
         common.write_bar(bar0_gpa, 0x88004, &cmd.to_le_bytes());
         assert_eq!(mock.config_dword(0x04) & 0xffff, u32::from(cmd));
@@ -4835,16 +4836,18 @@ mod tests {
             common.configuration.read_reg(COMMAND_REG) & 0xffff,
             u32::from(cmd)
         );
+        assert!(common.configuration.is_bar_released(0));
 
-        // A subsequent PCI config write still observes and drains the pending
-        // BAR reprogramming parameters.
-        let (reprogram, _) = common.write_config_register(COMMAND_REG, 0, &cmd.to_le_bytes());
-        assert_eq!(reprogram.install.len(), 1);
-        assert_eq!(reprogram.release[0].bar_idx, 0);
-        assert_eq!(reprogram.install[0].new_base, u64::from(new_bar0_gpa));
+        // A subsequent PCI config write installs the pending BAR.
+        let (reloc, _) = common.write_config_register(COMMAND_REG, 0, &cmd.to_le_bytes());
+        assert!(reloc.release.is_empty());
+        assert_eq!(reloc.install.len(), 1);
+        assert_eq!(reloc.install[0].bar_idx, 0);
+        assert_eq!(reloc.install[0].new_base, u64::from(new_bar0_gpa));
 
-        let (reprogram, _) = common.write_config_register(COMMAND_REG, 0, &cmd.to_le_bytes());
-        assert!(reprogram.is_empty());
+        common.configuration.on_bar_installed(0);
+        let (reloc, _) = common.write_config_register(COMMAND_REG, 0, &cmd.to_le_bytes());
+        assert!(reloc.is_empty());
     }
 
     #[test]
