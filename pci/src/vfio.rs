@@ -2072,7 +2072,6 @@ impl VfioCommon {
         }
 
         let mut reloc = BarRelocation::default();
-        self.configuration.drain_pending_relocation(&mut reloc);
         if reg_idx == COMMAND_REG {
             self.configuration.drain_pending_installs(&mut reloc);
         }

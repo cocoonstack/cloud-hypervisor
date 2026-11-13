@@ -10,7 +10,7 @@ use std::ops::DerefMut;
 use std::result;
 use std::sync::{Arc, Barrier, Mutex};
 
-use log::error;
+use log::{error, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_device::{BusDevice, BusDeviceSync};
@@ -300,10 +300,9 @@ impl PciBus {
                     device.on_bar_installed(a.bar_idx);
                 }
                 Err(e) => {
-                    error!(
-                        "Failed installing BAR {}: {:?}: at 0x{:x}; BAR left unmapped \
-until the guest's next decode-enable edge",
-                        a.bar_idx, e, a.new_base
+                    warn!(
+                        "Failed installing BAR {} at {:#x}: {:?}; retried on the next BAR or COMMAND write",
+                        a.bar_idx, a.new_base, e
                     );
                 }
             }
