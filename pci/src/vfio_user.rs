@@ -126,6 +126,12 @@ impl VfioUserPciDevice {
     /// Map all of the MMIO regions.
     pub fn map_mmio_regions(&mut self) -> Result<(), VfioUserPciDeviceError> {
         for mmio_region in &mut self.common.mmio_regions {
+            // A BAR released on restore keeps its mapping and slot for its
+            // install, but is not mapped into the guest yet.
+            let released = self
+                .common
+                .configuration
+                .is_bar_released(mmio_region.index as usize);
             let (region_flags, file_offset, sparse_areas) = {
                 let client = self.client.lock().unwrap();
                 let region = client
@@ -189,9 +195,11 @@ impl VfioUserPciDevice {
                         Arc::clone(&self.memory_slot_allocator),
                     )
                     .map_err(|e| VfioUserPciDeviceError::Other(io::Error::other(e)))?;
-                    mapping
-                        .register()
-                        .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
+                    if !released {
+                        mapping
+                            .register()
+                            .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
+                    }
                     let mapping = Arc::new(Mutex::new(mapping));
 
                     let user_memory_region = UserMemoryRegion {
@@ -475,6 +483,13 @@ impl PciDevice for VfioUserPciDevice {
         }
         Ok(())
     }
+
+    fn release_stale_bar(&mut self, bar_idx: usize, mapped_at: u64) -> bool {
+        self.common
+            .configuration
+            .release_stale_bar(bar_idx, mapped_at)
+    }
+
     fn is_bar_released(&self, bar_idx: usize) -> bool {
         self.common.configuration.is_bar_released(bar_idx)
     }
