@@ -561,7 +561,6 @@ pub struct PciConfiguration {
     last_capability: Option<(usize, usize)>,
     msix_cap_reg_idx: Option<usize>,
     msix_config: Option<Arc<Mutex<MsixConfig>>>,
-    pending_bar_reprogram: Vec<BarReprogrammingParams>,
     /// Whether each BAR slot (the ROM at ROM_BAR_IDX) is mapped at its
     /// register. Set by add_pci_bar() and on a reported install, cleared by
     /// a release. A restored device starts with every BAR mapped, at its
@@ -749,7 +748,6 @@ impl PciConfiguration {
             last_capability,
             msix_cap_reg_idx,
             msix_config,
-            pending_bar_reprogram: Vec::new(),
             bar_installed: [false; NUM_BAR_REGS + 1],
         };
 
@@ -764,23 +762,6 @@ impl PciConfiguration {
         config
     }
 
-    fn enqueue_bar_reprogramming(&mut self, param: BarReprogrammingParams) {
-        if let Some(idx) = self
-            .pending_bar_reprogram
-            .iter()
-            .position(|pending| pending.bar_idx == param.bar_idx)
-        {
-            // The mapping is still at the first old_base while decoding is
-            // disabled. Only the most recent destination needs to be applied.
-            self.pending_bar_reprogram[idx].new_base = param.new_base;
-            if self.pending_bar_reprogram[idx].old_base == param.new_base {
-                self.pending_bar_reprogram.remove(idx);
-            }
-        } else if param.old_base != param.new_base {
-            self.pending_bar_reprogram.push(param);
-        }
-    }
-
     fn state(&self) -> PciConfigurationState {
         PciConfigurationState {
             registers: (&self.registers).into(),
@@ -791,7 +772,7 @@ impl PciConfiguration {
             rom_bar_used: self.rom_bar_used,
             last_capability: self.last_capability,
             msix_cap_reg_idx: self.msix_cap_reg_idx,
-            pending_bar_reprogram: self.pending_bar_reprogram.clone(),
+            pending_bar_reprogram: Vec::new(),
         }
     }
 
@@ -941,7 +922,6 @@ impl PciConfiguration {
         self.bars[bar_idx].addr = self.registers[reg_idx];
         self.bars[bar_idx].used = true;
         self.bars[bar_idx].r#type = Some(config.region_type);
-
         self.bar_installed[bar_idx] = true;
 
         Ok(())
@@ -979,7 +959,6 @@ impl PciConfiguration {
         self.rom_bar_size =
             encode_32_bits_bar_size(config.size as u32).ok_or(Error::Encode32BarSize)?;
         self.rom_bar_used = true;
-
         self.bar_installed[ROM_BAR_IDX] = true;
 
         Ok(())
@@ -1100,52 +1079,29 @@ impl PciConfiguration {
             _ => (),
         }
 
-        // A released BAR is installed at its register once memory decoding
-        // is enabled, so a move of it is not queued.
-        if let Some(param) = self.detect_bar_reprogramming(reg_idx, data)
-            && self.bar_installed[param.bar_idx.expect("bar_idx is set on detection")]
-        {
-            self.enqueue_bar_reprogramming(param);
-        }
-
         let mut reloc = BarRelocation::default();
-        self.drain_pending_relocation(&mut reloc);
-        if reg_idx == COMMAND_REG {
+
+        // Release the old location as soon as the guest moves the BAR.
+        if let Some(param) = self.detect_bar_reprogramming(reg_idx, data) {
+            let slot = param.bar_idx.expect("bar_idx is set on detection");
+            if self.bar_installed[slot] {
+                reloc.release.push(ReleaseParams { bar_idx: slot });
+                self.bar_installed[slot] = false;
+            }
+        }
+        // Any BAR register write, moving the BAR or not, retries the installs.
+        let bar_written =
+            (BAR0_REG..BAR0_REG + NUM_BAR_REGS).contains(&reg_idx) || reg_idx == ROM_BAR_REG;
+
+        // After a BAR or COMMAND write, install every released BAR whose space
+        // is decoded: a moved BAR, a failed install or a newly enabled space.
+        if bar_written || reg_idx == COMMAND_REG {
             self.drain_pending_installs(&mut reloc);
         }
+
         reloc
     }
 
-    /// Add the pending BAR moves to `reloc` once memory decoding (MSE) is
-    /// enabled.
-    pub(crate) fn drain_pending_relocation(&mut self, reloc: &mut BarRelocation) {
-        if !self.pending_bar_reprogram.is_empty() {
-            if self.read_config_register(COMMAND_REG) & COMMAND_REG_MEMORY_SPACE_MASK
-                == COMMAND_REG_MEMORY_SPACE_MASK
-            {
-                for params in self.pending_bar_reprogram.drain(..) {
-                    let bar_idx = params
-                        .bar_idx
-                        .expect("bar_idx is set on detection and on restore");
-                    reloc.release.push(ReleaseParams { bar_idx });
-                    self.bar_installed[bar_idx] = false;
-                    reloc.install.push(InstallParams {
-                        bar_idx,
-                        new_base: params.new_base,
-                    });
-                }
-                info!("BAR relocation plan: {reloc:x?}");
-            } else {
-                info!(
-                    "MSE bit is disabled. No BAR relocation plan is returned: {:x?}",
-                    self.pending_bar_reprogram
-                );
-            }
-        }
-    }
-
-    // A failed install is not reported, so the slot stays released and is
-    // retried later.
     /// Queue the installs of every released BAR whose space is decoded.
     pub(crate) fn drain_pending_installs(&mut self, reloc: &mut BarRelocation) {
         reloc.install.extend(self.pending_bar_installs());
@@ -1154,6 +1110,8 @@ impl PciConfiguration {
         }
     }
 
+    // A failed install is not reported, so the slot stays released and is
+    // retried later.
     pub fn on_bar_installed(&mut self, bar_idx: usize) {
         self.bar_installed[bar_idx] = true;
     }
@@ -1648,6 +1606,7 @@ mod tests {
         assert_eq!(reprogram.install.len(), 1);
         assert_eq!(reprogram.install[0].new_base, 0xd000_0000);
         assert_eq!(cfg.read_reg(BAR0_REG), 0xd000_0000);
+        cfg.on_bar_installed(0);
 
         // An 8 GiB BAR has no writable address bit in its low half and
         // none below bit 33 in its high half.
@@ -1661,6 +1620,7 @@ mod tests {
         assert_eq!(reprogram.install[0].new_base, 0xa_0000_0000);
         assert_eq!(cfg.read_reg(BAR0_REG + 3), 0xa);
         assert_eq!(cfg.get_bar_addr(2), 0xa_0000_0000);
+        cfg.on_bar_installed(2);
 
         let reprogram = cfg.write_config_register(ROM_BAR_REG, 0, &0xf000_8001u32.to_le_bytes());
         assert!(reprogram.is_empty());
@@ -1824,6 +1784,8 @@ mod tests {
         assert_eq!(aliased.install.len(), 1);
         assert_eq!(aliased.install[0].bar_idx, 0);
         assert_eq!(cfg.get_bar_addr(0), cfg.get_bar_addr(1));
+        // The move lands; otherwise the next write re-emits BAR0's install.
+        cfg.on_bar_installed(0);
 
         let reprogram = cfg.write_config_register(BAR0_REG + 1, 0, &0xe000_0000u32.to_le_bytes());
 
@@ -1881,47 +1843,6 @@ mod tests {
         assert_eq!(reprogram.install[0].bar_idx, ROM_BAR_IDX);
         assert_eq!(reprogram.release[0].bar_idx, ROM_BAR_IDX);
         assert_eq!(reprogram.install[0].new_base, 0xf100_0000);
-    }
-
-    #[test]
-    fn deferred_bar_moves_preserve_the_mapped_address() {
-        let mut cfg = reloc_config(None);
-        add_reloc_bar(&mut cfg, 0, 0xc000_0000);
-        add_reloc_bar(&mut cfg, 1, 0xd000_0000);
-        cfg.write_reg(COMMAND_REG, 0);
-
-        for i in 1..=128u32 {
-            for idx in 0..2 {
-                let address = 0xe000_0000 + (idx as u32 * 0x100 + i) * RELOC_BAR_SIZE as u32;
-                assert!(
-                    cfg.write_config_register(BAR0_REG + idx, 0, &address.to_le_bytes())
-                        .is_empty()
-                );
-            }
-            assert_eq!(cfg.pending_bar_reprogram.len(), 2);
-        }
-        let pending =
-            cfg.write_config_register(COMMAND_REG, 0, &COMMAND_REG_MEMORY_SPACE_MASK.to_le_bytes());
-        assert_eq!(pending.release.len(), 2);
-        assert_eq!(pending.install.len(), 2);
-        for (idx, (release, install)) in pending.release.iter().zip(&pending.install).enumerate() {
-            assert_eq!(release.bar_idx, idx);
-            assert_eq!(install.bar_idx, idx);
-            assert_eq!(install.new_base, cfg.get_bar_addr(idx));
-        }
-    }
-
-    #[test]
-    fn deferred_bar_move_back_to_mapped_address_is_a_noop() {
-        let mut cfg = reloc_config(None);
-        add_reloc_bar(&mut cfg, 0, 0xc000_0000);
-        cfg.write_reg(COMMAND_REG, 0);
-        cfg.write_config_register(BAR0_REG, 0, &0xd000_0000u32.to_le_bytes());
-        cfg.write_config_register(BAR0_REG, 0, &0xc000_0000u32.to_le_bytes());
-        assert!(cfg.pending_bar_reprogram.is_empty());
-        assert!(cfg.write_config_register(
-            COMMAND_REG, 0, &COMMAND_REG_MEMORY_SPACE_MASK.to_le_bytes(),
-        ).is_empty());
     }
 
     #[test]
