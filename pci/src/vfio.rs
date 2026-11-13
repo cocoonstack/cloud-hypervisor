@@ -963,6 +963,7 @@ impl VfioCommon {
             if region.index as usize != bar_idx {
                 continue;
             }
+            let old_base = region.start.raw_value();
             let new_addresses = region
                 .bar_memory_regions
                 .iter()
@@ -983,19 +984,44 @@ impl VfioCommon {
                     Ok(new_address)
                 })
                 .collect::<Result<Vec<_>, VfioPciError>>()?;
-            for (bar_memory_region, new_address) in
-                region.bar_memory_regions.iter_mut().zip(new_addresses)
-            {
-                bar_memory_region
-                    .move_region(new_address)
-                    .map_err(VfioPciError::MoveBarMemoryRegion)?;
-                bar_memory_region
-                    .region
-                    .lock()
-                    .unwrap()
-                    .register()
-                    .map_err(VfioPciError::CreateUserMemoryRegion)?;
-                bar_memory_region.map_for_p2p()?;
+            for (i, &new_address) in new_addresses.iter().enumerate() {
+                let bar_memory_region = &mut region.bar_memory_regions[i];
+                let result = (|| {
+                    bar_memory_region
+                        .move_region(new_address)
+                        .map_err(VfioPciError::MoveBarMemoryRegion)?;
+                    bar_memory_region
+                        .region
+                        .lock()
+                        .unwrap()
+                        .register()
+                        .map_err(VfioPciError::CreateUserMemoryRegion)?;
+                    bar_memory_region.map_for_p2p()
+                })();
+                if let Err(e) = result {
+                    // The caller gives the range back, so no area may stay mapped there.
+                    for bar_memory_region in &mut region.bar_memory_regions[..=i] {
+                        let unwind: Result<(), VfioPciError> = (|| {
+                            bar_memory_region
+                                .unmap_p2p()
+                                .map_err(VfioPciError::DmaUnmap)?;
+                            bar_memory_region
+                                .region
+                                .lock()
+                                .unwrap()
+                                .unregister()
+                                .map_err(VfioPciError::MoveBarMemoryRegion)?;
+                            bar_memory_region
+                                .move_region(old_base + bar_memory_region.offset)
+                                .map_err(VfioPciError::MoveBarMemoryRegion)
+                        })();
+                        if let Err(unwind) = unwind {
+                            error!("FATAL: Failed to unwind BAR install: {unwind:?}");
+                            process::exit(1);
+                        }
+                    }
+                    return Err(e);
+                }
             }
             region.start = GuestAddress(new_base);
         }
@@ -3452,6 +3478,65 @@ mod tests {
             let mapping = entry.region.lock().unwrap();
             assert_eq!(mapping.slot(), Some(slots[i]));
             assert!(mapping.is_registered());
+        }
+    }
+
+    #[cfg(feature = "kvm")]
+    #[test]
+    fn move_bar_commit_unwinds_sparse_areas_after_failed_install() {
+        let page_size = get_page_size();
+        let vm = hypervisor::new()
+            .unwrap()
+            .create_vm(hypervisor::HypervisorVmConfig::default())
+            .unwrap();
+        let slot_allocator = Arc::new(MemorySlotAllocator::new(
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let mut regions = Vec::new();
+        for address in [page_size, 3 * page_size, 6 * page_size] {
+            let mapping = GuestRegion::from_mmap(
+                vm_memory::MmapRegion::new(page_size as usize).unwrap(),
+                GuestAddress(address),
+                Arc::clone(&vm),
+                Arc::clone(&slot_allocator),
+                false,
+                false,
+                false,
+                hypervisor::MemoryVisibility::Shared,
+            )
+            .unwrap();
+            mapping.register().unwrap();
+            regions.push(VfioBarMemoryRegion {
+                offset: address - page_size,
+                region: Arc::new(Mutex::new(mapping)),
+                p2p_mapping: None,
+            });
+        }
+        // The second area will collide with this slot after the first moves.
+        let _blocker = regions.pop().unwrap();
+        let slots: Vec<_> = regions
+            .iter()
+            .map(|entry| entry.region.lock().unwrap().slot().unwrap())
+            .collect();
+        let mut common = test_vfio_common(Arc::new(DefaultVfio), None);
+        common.bars.push(VfioBar {
+            start: GuestAddress(page_size),
+            length: 3 * page_size,
+            type_: PciBarRegionType::Memory32BitRegion,
+            index: 0,
+            bar_memory_regions: regions,
+        });
+
+        common.move_bar_prepare(0).unwrap();
+        common.move_bar_commit(0, 4 * page_size).unwrap_err();
+
+        assert_eq!(common.bars[0].start, GuestAddress(page_size));
+        for (i, entry) in common.bars[0].bar_memory_regions.iter().enumerate() {
+            let mapping = entry.region.lock().unwrap();
+            assert_eq!(mapping.start_addr(), GuestAddress(page_size + entry.offset));
+            assert_eq!(mapping.slot(), Some(slots[i]));
+            assert!(!mapping.is_registered());
         }
     }
 
