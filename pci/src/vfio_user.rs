@@ -28,8 +28,8 @@ use crate::vfio::{
     UserMemoryRegion, VFIO_COMMON_ID, Vfio, VfioCommon, VfioCommonConfig, VfioError, find_alignment,
 };
 use crate::{
-    BarReprogrammingParams, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError, PciSubclass,
-    VfioPciError,
+    BarRelocation, InstallParams, PciBarConfiguration, PciBdf, PciDevice, PciDeviceError,
+    PciSubclass, VfioPciError,
 };
 
 pub struct VfioUserPciDevice {
@@ -127,6 +127,12 @@ impl VfioUserPciDevice {
     /// Map all of the MMIO regions.
     pub fn map_mmio_regions(&mut self) -> Result<(), VfioUserPciDeviceError> {
         for mmio_region in &mut self.common.mmio_regions {
+            // A BAR released on restore keeps its mapping and slot for its
+            // install, but is not mapped into the guest yet.
+            let released = self
+                .common
+                .configuration
+                .is_bar_released(mmio_region.index as usize);
             let (region_flags, file_offset, sparse_areas) = {
                 let client = self.client.lock().unwrap();
                 let region = client
@@ -190,9 +196,11 @@ impl VfioUserPciDevice {
                         Arc::clone(&self.memory_slot_allocator),
                     )
                     .map_err(|e| VfioUserPciDeviceError::Other(io::Error::other(e)))?;
-                    mapping
-                        .register()
-                        .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
+                    if !released {
+                        mapping
+                            .register()
+                            .map_err(VfioUserPciDeviceError::MapRegionGuest)?;
+                    }
                     let mapping = Arc::new(Mutex::new(mapping));
 
                     let user_memory_region = UserMemoryRegion {
@@ -378,10 +386,6 @@ impl PciDevice for VfioUserPciDevice {
             .free_bars(allocator, mmio32_allocator, mmio64_allocator)
     }
 
-    fn restore_bar_addr(&mut self, params: &BarReprogrammingParams) {
-        self.common.configuration.restore_bar_addr(params);
-    }
-
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
@@ -391,7 +395,7 @@ impl PciDevice for VfioUserPciDevice {
         reg_idx: usize,
         offset: u64,
         data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    ) -> (BarRelocation, Option<Arc<Barrier>>) {
         self.common.write_config_register(reg_idx, offset, data)
     }
 
@@ -407,8 +411,26 @@ impl PciDevice for VfioUserPciDevice {
         self.common.write_bar(base, offset, data)
     }
 
-    fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
-        info!("Moving BAR {bar_idx} -> 0x{new_base:x}");
+    fn move_bar_prepare(&mut self, bar_idx: usize) -> Result<(), io::Error> {
+        info!("Unmapping BAR {bar_idx}");
+        for mmio_region in &mut self.common.mmio_regions {
+            if mmio_region.index as usize != bar_idx {
+                continue;
+            }
+            for user_memory_region in &mut mmio_region.user_memory_regions {
+                user_memory_region
+                    .mapping
+                    .lock()
+                    .unwrap()
+                    .unregister()
+                    .map_err(io::Error::other)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn move_bar_commit(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
+        info!("Mapping BAR {bar_idx} -> 0x{new_base:x}");
         for mmio_region in &mut self.common.mmio_regions {
             if mmio_region.index as usize != bar_idx {
                 continue;
@@ -424,30 +446,33 @@ impl PciDevice for VfioUserPciDevice {
                     new_address
                         .checked_add(user_memory_region.size() as u64)
                         .ok_or_else(|| io::Error::other("BAR range overflows"))?;
-                    Ok((user_memory_region.start(), new_address))
+                    Ok(new_address)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            for (i, &(_, new_address)) in new_addresses.iter().enumerate() {
+            for (i, &new_address) in new_addresses.iter().enumerate() {
                 let user_memory_region = &mut mmio_region.user_memory_regions[i];
-                let result = user_memory_region.move_region(new_address);
+                let result = user_memory_region.move_region(new_address).and_then(|()| {
+                    user_memory_region
+                        .mapping
+                        .lock()
+                        .unwrap()
+                        .register()
+                        .map_err(io::Error::other)
+                });
                 if let Err(e) = result {
-                    for (user_memory_region, &(old_address, _)) in mmio_region.user_memory_regions
-                        [..=i]
-                        .iter_mut()
-                        .zip(&new_addresses[..=i])
-                        .rev()
-                    {
-                        let rollback = user_memory_region.move_region(old_address).and_then(|()| {
-                            let mapping = user_memory_region.mapping.lock().unwrap();
-                            if mapping.is_registered() {
-                                Ok(())
-                            } else {
-                                mapping.register().map_err(io::Error::other)
-                            }
+                    // The caller gives the range back, so no area may stay mapped there.
+                    for user_memory_region in &mut mmio_region.user_memory_regions[..=i] {
+                        let unwind = user_memory_region
+                            .mapping
+                            .lock()
+                            .unwrap()
+                            .unregister()
+                            .map_err(io::Error::other);
+                        let unwind = unwind.and_then(|()| {
+                            user_memory_region.move_region(old_base + user_memory_region.offset)
                         });
-                        if let Err(rollback) = rollback {
-                            // Continuing would leave the BAR with inconsistent mappings.
-                            error!("FATAL: Failed to restore BAR mapping: {rollback}");
+                        if let Err(unwind) = unwind {
+                            error!("FATAL: Failed to unwind BAR install: {unwind}");
                             process::exit(1);
                         }
                     }
@@ -458,6 +483,24 @@ impl PciDevice for VfioUserPciDevice {
             info!("Moved bar 0x{old_base:x} -> 0x{new_base:x}");
         }
         Ok(())
+    }
+
+    fn release_stale_bar(&mut self, bar_idx: usize, mapped_at: u64) -> bool {
+        self.common
+            .configuration
+            .release_stale_bar(bar_idx, mapped_at)
+    }
+
+    fn is_bar_released(&self, bar_idx: usize) -> bool {
+        self.common.configuration.is_bar_released(bar_idx)
+    }
+
+    fn on_bar_installed(&mut self, bar_idx: usize) {
+        self.common.configuration.on_bar_installed(bar_idx);
+    }
+
+    fn pending_bar_installs(&self) -> Vec<InstallParams> {
+        self.common.configuration.pending_bar_installs()
     }
 
     fn id(&self) -> Option<String> {
