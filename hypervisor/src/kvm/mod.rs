@@ -1190,6 +1190,12 @@ impl vm::Vm for KvmVm {
         state: &ClockState,
         mode: ClockRestoreMode,
     ) -> vm::Result<()> {
+        if mode == ClockRestoreMode::SnapshotRestoreNoCatchUp {
+            // KVM advances kvmclock by the wall time elapsed since a saved
+            // `KVM_CLOCK_REALTIME`. Without it, kvmclock continues from the
+            // saved value, which matches the TSC restored with the vCPUs.
+            return self.set_clock(&state.data.without_realtime());
+        }
         self.set_clock(&state.data)?;
         if mode != ClockRestoreMode::SnapshotRestore || !state.data.has_realtime() {
             return Ok(());
@@ -1248,7 +1254,9 @@ impl vm::Vm for KvmVm {
 
     /// Advance the guest virtual counter to current wall time before the vCPUs
     /// resume. A no-op for a `SameHostResume` (the counter free-ran across the
-    /// pause); on `SnapshotRestore`/migration-receive it must catch up.
+    /// pause) and for a `SnapshotRestoreNoCatchUp` (the counter stays at the
+    /// value restored with the vCPUs); on `SnapshotRestore`/migration-receive
+    /// it must catch up.
     #[cfg(target_arch = "aarch64")]
     fn restore_clock(
         &self,
@@ -1256,7 +1264,7 @@ impl vm::Vm for KvmVm {
         saved: &ClockState,
         mode: ClockRestoreMode,
     ) -> vm::Result<()> {
-        if mode == ClockRestoreMode::SameHostResume {
+        if mode != ClockRestoreMode::SnapshotRestore {
             return Ok(());
         }
         // KVM does not rescale the counter frequency across hosts (unlike x86
@@ -3732,13 +3740,17 @@ mod tests {
         }
 
         fn restore_clock(&self, state: &ClockState) {
+            self.restore_clock_with_mode(state, ClockRestoreMode::SnapshotRestore);
+        }
+
+        fn restore_clock_with_mode(&self, state: &ClockState, mode: ClockRestoreMode) {
             self.vm
-                .restore_clock(
-                    &[self.vcpu.as_ref()],
-                    state,
-                    ClockRestoreMode::SnapshotRestore,
-                )
+                .restore_clock(&[self.vcpu.as_ref()], state, mode)
                 .unwrap();
+        }
+
+        fn kvmclock_ns(&self) -> u64 {
+            kvm_clock_data::from(self.vm.get_clock().unwrap()).clock
         }
     }
 
@@ -3779,6 +3791,29 @@ mod tests {
         assert!(
             vm.read_msr(msr_index::MSR_IA32_TSC_DEADLINE) <= vm.read_msr(msr_index::MSR_IA32_TSC)
         );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_restore_clock_without_catch_up_keeps_saved_clock() {
+        const GAP_SECS: u64 = 3600;
+        const GAP_NS: u64 = GAP_SECS * 1_000_000_000;
+
+        let vm = TscDeadlineVm::new();
+        let state = vm.clock_state_with_gap(GAP_SECS);
+        let saved_ns = kvm_clock_data::from(state.data).clock;
+        let saved_tsc = state.tsc.unwrap();
+
+        vm.restore_clock_with_mode(&state, ClockRestoreMode::SnapshotRestoreNoCatchUp);
+        let kvmclock_ns = vm.kvmclock_ns();
+        assert!(kvmclock_ns >= saved_ns);
+        assert!(kvmclock_ns < saved_ns + GAP_NS);
+        assert!(vm.read_msr(msr_index::MSR_IA32_TSC) < saved_tsc + GAP_SECS * vm.tsc_hz);
+
+        // The same state with catch-up advances both clocks by the gap.
+        vm.restore_clock(&state);
+        assert!(vm.kvmclock_ns() >= saved_ns + GAP_NS);
+        assert!(vm.read_msr(msr_index::MSR_IA32_TSC) >= saved_tsc + GAP_SECS * vm.tsc_hz);
     }
 
     #[test]
