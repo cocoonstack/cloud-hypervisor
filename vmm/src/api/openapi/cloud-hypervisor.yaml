@@ -1936,6 +1936,9 @@ components:
           type: boolean
         memory_restore_mode:
           $ref: "#/components/schemas/MemoryRestoreMode"
+        clock_catchup:
+          type: boolean
+          default: true
         net_fds:
           type: array
           deprecated: true

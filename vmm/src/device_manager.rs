@@ -6794,6 +6794,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let manager = vm.device_manager().lock().unwrap();
