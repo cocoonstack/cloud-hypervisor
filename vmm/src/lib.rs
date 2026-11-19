@@ -1493,6 +1493,8 @@ impl Vmm {
                 self.console_resize_pipe.clone(),
                 Arc::clone(&self.original_termios_opt),
                 Some(&snapshot),
+                // A received migration always catches up to wall time.
+                true,
                 #[cfg(feature = "igvm")]
                 None,
             )
@@ -2086,6 +2088,7 @@ impl Vmm {
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        clock_catchup: bool,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -2138,6 +2141,7 @@ impl Vmm {
                     Some(source_url),
                     Some(prefault),
                     Some(memory_restore_mode),
+                    Some(clock_catchup),
                 )?;
 
                 {
@@ -2546,6 +2550,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2730,6 +2735,7 @@ impl RequestHandler for Vmm {
                     vm_config,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
+                    restore_cfg.clock_catchup,
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {
@@ -2826,6 +2832,7 @@ impl RequestHandler for Vmm {
             self.console_info.clone(),
             self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
+            None,
             None,
             None,
             None,

@@ -3105,14 +3105,21 @@ pub struct RestoredVfioConfig {
     pub fd: ExternalFd,
 }
 
+fn default_restoreconfig_clock_catchup() -> bool {
+    true
+}
+
 #[serde_with::skip_serializing_none]
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RestoreConfig {
     pub source_url: PathBuf,
     #[serde(default)]
     pub prefault: bool,
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
+    /// Advance the guest clock by the time elapsed since the snapshot.
+    #[serde(default = "default_restoreconfig_clock_catchup")]
+    pub clock_catchup: bool,
     /// Deprecated: use `external_fds` with network targets instead.
     #[serde(default)]
     pub net_fds: Option<Vec<RestoredNetConfig>>,
@@ -3135,10 +3142,29 @@ pub struct RestoreConfig {
     pub(crate) external_fds: ExternalFds,
 }
 
+impl Default for RestoreConfig {
+    fn default() -> Self {
+        RestoreConfig {
+            source_url: PathBuf::default(),
+            prefault: false,
+            memory_restore_mode: MemoryRestoreMode::default(),
+            clock_catchup: default_restoreconfig_clock_catchup(),
+            net_fds: None,
+            vfio_fds: None,
+            iommufd_fd: ExternalFd::default(),
+            resume: false,
+            zone_updates: Vec::new(),
+            serial: None,
+            console: None,
+            external_fds: ExternalFds::default(),
+        }
+    }
+}
+
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot.\
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,\
-        memory_restore_mode=copy|ondemand|copyonwrite,\
+        memory_restore_mode=copy|ondemand|copyonwrite,clock_catchup=on|off,\
         external_fds=[net(<id>)@[<fd>,...],vfio(<id>)@[<fd>],iommu@[<fd>]],resume=true|false,\
         zone_updates=<list_of_updates>,\
         serial_file=<path>|serial_socket=<path>|serial_tcp=<ip>:<port>,\
@@ -3150,6 +3176,9 @@ impl RestoreConfig {
         `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if \
         userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the \
         snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise)\
+        \n`clock_catchup` controls whether the guest clock is advanced by the time elapsed \
+        since the snapshot (enabled by default). When disabled, the guest clock continues \
+        from the snapshot.\
         \n`external_fds` provides replacement file descriptors. `net(<id>)` entries replace \
         the FDs of network devices, `vfio(<id>)` entries replace VFIO cdev FDs, and `iommu` \
         provides the iommufd FD. \
@@ -3171,6 +3200,7 @@ impl RestoreConfig {
             .add("source_url")
             .add("prefault")
             .add("memory_restore_mode")
+            .add("clock_catchup")
             .add("net_fds")
             .add("vfio_fds")
             .add("iommufd_fd")
@@ -3199,6 +3229,11 @@ impl RestoreConfig {
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
             .unwrap_or_default();
+        let clock_catchup = parser
+            .convert::<Toggle>("clock_catchup")
+            .map_err(Error::ParseRestore)?
+            .unwrap_or(Toggle(default_restoreconfig_clock_catchup()))
+            .0;
         let mut net_fds = parser
             .convert::<TupleList<String, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
@@ -3283,6 +3318,7 @@ impl RestoreConfig {
             source_url,
             prefault,
             memory_restore_mode,
+            clock_catchup,
             net_fds,
             vfio_fds,
             iommufd_fd,
@@ -7025,6 +7061,15 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
         assert_eq!(
             // SAFETY: This input contains no inherited descriptors.
+            unsafe { RestoreConfig::parse("source_url=/path/to/snapshot,clock_catchup=off") }?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                clock_catchup: false,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            // SAFETY: This input contains no inherited descriptors.
             unsafe {
                 RestoreConfig::parse(
                     "source_url=/path/to/snapshot,resume=on,zone_updates=[zone1@1]",
@@ -7108,6 +7153,18 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_restore_config_serde() {
+        assert!(
+            serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#)
+                .unwrap()
+                .clock_catchup
+        );
+        assert!(
+            !serde_json::from_str::<RestoreConfig>(
+                r#"{"source_url":"/path/to/snapshot","clock_catchup":false}"#
+            )
+            .unwrap()
+            .clock_catchup
+        );
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#)
                 .unwrap()
