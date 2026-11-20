@@ -321,8 +321,9 @@ pub trait Vm: Send + Sync + Any {
     }
     /// Re-establish the guest clock before the vCPUs resume. `mode` distinguishes a
     /// same-host pause/resume (the clock kept running) from a restore/migration where
-    /// it must catch up to wall time. aarch64 writes the counter on all `vcpus` (older
-    /// kernels track the offset per-vCPU).
+    /// it must catch up to wall time, and from a restore that continues from the saved
+    /// clock. aarch64 writes the counter on all `vcpus` (older kernels track the offset
+    /// per-vCPU).
     fn restore_clock(
         &self,
         _vcpus: &[&dyn Vcpu],

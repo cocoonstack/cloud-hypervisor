@@ -214,6 +214,23 @@ impl ClockData {
         }
     }
 
+    /// Returns the clock without `CLOCK_REALTIME`, so that restoring it leaves
+    /// the guest clock at the saved value instead of advancing it by the wall
+    /// time elapsed since the capture.
+    #[must_use]
+    pub fn without_realtime(mut self) -> Self {
+        match &mut self {
+            #[cfg(feature = "kvm")]
+            ClockData::Kvm(s) => {
+                s.realtime = 0;
+                s.flags &= !kvm_bindings::KVM_CLOCK_REALTIME;
+            }
+            #[allow(unreachable_patterns)]
+            _ => {}
+        }
+        self
+    }
+
     /// Returns the clock with `CLOCK_REALTIME` filled from the host wall clock
     /// when absent, so a later restore can advance the guest to current wall
     /// time. No-op for backends without a realtime field (e.g. MSHV).
@@ -258,13 +275,17 @@ pub struct TimerState {
 
 /// How the guest clock is re-established when the vCPUs resume: a same-host
 /// pause/resume left it running, whereas a snapshot restore / migration-receive
-/// means the guest was off-host and the clock must catch up to wall time.
+/// means the guest was off-host and the clock must catch up to wall time,
+/// unless the restore asked for the guest to continue from the saved clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockRestoreMode {
     /// Same-host pause -> resume; the clock kept running, nothing to advance.
     SameHostResume,
     /// Restored from a snapshot or migrated in; advance to current wall time.
     SnapshotRestore,
+    /// Restored from a snapshot; continue from the saved clock, as if no time
+    /// had passed since the snapshot was taken.
+    SnapshotRestoreNoCatchUp,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
