@@ -266,6 +266,25 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   page-cache sharing is lost for that VM and host memory use grows to the
   eager-copy level. The same applies to `ondemand` restores.
 
+### Guest clock after restore
+
+By default, a restore advances the guest clock by the wall time that elapsed
+since the snapshot was taken, so the guest resumes with the current time. With
+`clock_catchup=off`, the guest clock continues from its value in the snapshot,
+as if no time had passed:
+
+```bash
+./cloud-hypervisor \
+    --api-socket /tmp/cloud-hypervisor.sock \
+    --restore source_url=file:///home/foo/snapshot,clock_catchup=off
+```
+
+The guest's wall clock is then behind by the age of the snapshot until
+something in the guest sets it, for example an NTP client or a guest agent.
+This is for guests that do not handle a large forward jump of their monotonic
+clock. A VM received through a migration, which includes a restore from an
+offload daemon, always catches up.
+
 ## Restore a VM with new external FDs
 
 For a VM created with FDs explicitly passed to `NetConfig`, replacement FDs
