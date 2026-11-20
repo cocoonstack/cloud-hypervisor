@@ -490,8 +490,9 @@ fn is_restore_cow_supported(config: &VmConfig) -> bool {
 
 /// Guest clock baseline captured for snapshot/restore, plus how it must be
 /// re-established on the next resume. `mode` is runtime-only (`SnapshotRestore`
-/// after restore/migration-receive, `SameHostResume` for a live same-host capture)
-/// and is not serialized: it is re-derived from "was this VM built from a snapshot".
+/// after restore/migration-receive, `SnapshotRestoreNoCatchUp` after a restore
+/// with `clock_catchup=off`, `SameHostResume` for a live same-host capture) and
+/// is not serialized: it is re-derived from how this VM was built.
 #[derive(Clone, Copy)]
 struct SavedClock {
     mode: hypervisor::ClockRestoreMode,
@@ -559,6 +560,7 @@ impl Vm {
         console_resize_pipe: Option<Arc<File>>,
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
+        clock_catchup: bool,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
@@ -664,11 +666,14 @@ impl Vm {
         let saved_clock = if let Some(snapshot) = snapshot.as_ref() {
             let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::Restore)?;
             // Restored or migrated in: the guest clock must catch up to wall time
-            // on resume (the counter was reset to the saved value).
-            vm_snapshot.clock.map(|state| SavedClock {
-                mode: hypervisor::ClockRestoreMode::SnapshotRestore,
-                state,
-            })
+            // on resume (the counter was reset to the saved value), unless the
+            // restore asked for the guest to continue from the saved clock.
+            let mode = if clock_catchup {
+                hypervisor::ClockRestoreMode::SnapshotRestore
+            } else {
+                hypervisor::ClockRestoreMode::SnapshotRestoreNoCatchUp
+            };
+            vm_snapshot.clock.map(|state| SavedClock { mode, state })
         } else {
             None
         };
@@ -1351,6 +1356,7 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
+        clock_catchup: Option<bool>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1447,6 +1453,7 @@ impl Vm {
             console_resize_pipe,
             original_termios,
             snapshot,
+            clock_catchup.unwrap_or(true),
             #[cfg(feature = "igvm")]
             igvm_file,
         )
